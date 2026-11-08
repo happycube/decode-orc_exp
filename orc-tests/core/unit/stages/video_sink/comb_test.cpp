@@ -86,13 +86,22 @@ TEST(CombTest, Configuration_LookAroundDependsOnDimensions) {
   Comb::Configuration c2d;
   c2d.dimensions = 2;
 
+  // ntsc3d compares the frames two either side; ntsc3dnoadapt only uses the
+  // previous frame.
   Comb::Configuration c3d;
   c3d.dimensions = 3;
+  c3d.adaptive = true;
+
+  Comb::Configuration c3dPrevious;
+  c3dPrevious.dimensions = 3;
+  c3dPrevious.adaptive = false;
 
   EXPECT_EQ(c2d.getLookBehind(), 0);
   EXPECT_EQ(c2d.getLookAhead(), 0);
-  EXPECT_EQ(c3d.getLookBehind(), 1);
-  EXPECT_EQ(c3d.getLookAhead(), 1);
+  EXPECT_EQ(c3d.getLookBehind(), 2);
+  EXPECT_EQ(c3d.getLookAhead(), 2);
+  EXPECT_EQ(c3dPrevious.getLookBehind(), 1);
+  EXPECT_EQ(c3dPrevious.getLookAhead(), 1);
 }
 
 TEST(CombTest, DecodeFramesYcPath_PreservesLumaInActiveRegion) {
@@ -404,7 +413,64 @@ FieldPairChroma decode_flat_colour(int32_t field1_phase_id,
           output[0].v(line + 1)[h]};
 }
 
+// A field of uniform blanking: what a sink pads a sequence's ends with.
+OwnedField make_blank_field(bool is_first_field) {
+  OwnedField of;
+  of.field.is_yc = false;
+  of.field.is_first_field = is_first_field;
+  of.field.line_count = kNtscFieldLines;
+  of.field.samples_per_line = kNtscSamplesPerLine;
+  of.composite_buf.assign(
+      static_cast<size_t>(kNtscFieldLines * kNtscSamplesPerLine),
+      static_cast<int16_t>(orc::kNtscBlanking));
+  of.field.data = of.composite_buf.data();
+  return of;
+}
+
 }  // namespace
+
+TEST(CombTest, Adaptive3D_BlankPaddingFrames_AreTreatedAsMissing) {
+  // The adaptive 3D comb looks two frames either side. At a sequence's ends
+  // the sink pads with blank fields, which must not be used as neighbours:
+  // the frame decodes exactly as it does with no neighbours at all.
+  const auto params = make_full_ntsc_video_params();
+  Comb::Configuration config;
+  config.dimensions = 3;
+  config.adaptive = true;
+  config.phaseCompensation = false;
+
+  auto field1 = make_flat_colour_field(true, 1, 0);
+  auto field2 = make_flat_colour_field(
+      false, 2, static_cast<int64_t>(kNtscFieldLines) * kNtscSamplesPerLine);
+
+  Comb alone;
+  alone.updateConfiguration(params, config);
+  std::vector<SourceField> single = {field1.field, field2.field};
+  std::vector<ComponentFrame> aloneOut(1);
+  alone.decodeFrames(single, 0, 2, aloneOut);
+
+  std::vector<OwnedField> blanks;
+  for (int i = 0; i < 8; i++) blanks.push_back(make_blank_field(i % 2 == 0));
+  std::vector<SourceField> padded;
+  for (int i = 0; i < 4; i++) padded.push_back(blanks[i].field);
+  padded.push_back(field1.field);
+  padded.push_back(field2.field);
+  for (int i = 4; i < 8; i++) padded.push_back(blanks[i].field);
+
+  Comb withPadding;
+  withPadding.updateConfiguration(params, config);
+  std::vector<ComponentFrame> paddedOut(1);
+  withPadding.decodeFrames(padded, 4, 6, paddedOut);
+
+  for (int line = params.first_active_frame_line;
+       line < params.last_active_frame_line; line++) {
+    for (int h = params.active_video_start; h < params.active_video_end; h++) {
+      ASSERT_DOUBLE_EQ(paddedOut[0].y(line)[h], aloneOut[0].y(line)[h]);
+      ASSERT_DOUBLE_EQ(paddedOut[0].u(line)[h], aloneOut[0].u(line)[h]);
+      ASSERT_DOUBLE_EQ(paddedOut[0].v(line)[h], aloneOut[0].v(line)[h]);
+    }
+  }
+}
 
 TEST(CombTest, PerFieldPhaseIds_DecodeBothFieldsToTheSameColour) {
   const auto c = decode_flat_colour(1, 2);

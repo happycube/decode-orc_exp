@@ -34,7 +34,7 @@ Only used when `decoder_type` is `multiple`. Comma-separated `first-last:decoder
 
 Frame numbers are 1-based in the GUI, matching the preview, and stored 0-based in the project file (`transform3d,1000-1499:transform2d,...` for the example above).
 
-A `held:decoder` entry decodes the frames that show a held picture, as the stage before the sink reports it, and needs a default decoder beside it for the rest: `transform2d, held:transform3d`. Today the Stacker reports it, from the repeats `still_frame_stacking` finds: a frame counts as held when the same picture is shown for at least as many frames either side as the held decoder reads (4 for `transform3d`, 1 for `ntsc3d`), so the 3D decoder only ever sees one picture, and a disc of single-frame stills is decoded entirely with the default. A range overrules it, so a hand-written range can still force a decoder. Without a Stacker with `still_frame_stacking` on upstream, no frame is held and the default decodes everything.
+A `held:decoder` entry decodes the frames that show a held picture, as the stage before the sink reports it, and needs a default decoder beside it for the rest: `transform2d, held:transform3d`. Today the Stacker reports it, from the repeats `still_frame_stacking` finds: a frame counts as held when the same picture is shown for at least as many frames either side as the held decoder reads (4 for `transform3d`, 2 for `ntsc3d`), so the 3D decoder only ever sees one picture, and a disc of single-frame stills is decoded entirely with the default. A range overrules it, so a hand-written range can still force a decoder. Without a Stacker with `still_frame_stacking` on upstream, no frame is held and the default decodes everything.
 
 Every frame must have a decoder: an export whose schedule leaves a frame without one, and gives no default, is refused before anything is written (for a piped source of unknown length, the export stops with an error at the first such frame). The decoders must all suit the project format, and the dialog only accepts the decoders the Decoder Type list offers. Each frame is decoded with exactly the look-around its own decoder uses, so a frame comes out as it would from an export with that decoder alone; `noise_reduction` runs over the whole output and carries on across schedule boundaries. The preview shows each frame with its scheduled decoder. For a Y/C source, `transform2d`/`transform3d`/`palstill` ranges are decoded with `pal2d`, as for a single decoder.
 
@@ -97,11 +97,11 @@ Enable simple PAL mode (1D UV filter for Transform PAL: simpler, faster, lower q
 ### transform_threshold (double)
 Similarity threshold for the Transform PAL decoder. Higher values apply more transform filtering. Range: 0.0–1.0. Default: `0.4`. Applies to the `transform2d`/`transform3d`/`palstill` decoders only.
 
-### chroma_weight (double)
-Chroma weight for the NTSC 3D adaptive filter: it scales the bias the filter gives to line, field and frame candidates over the same-line (1D) ones, so higher values favour those candidates — and so the 3D result — more strongly, in the same direction as `adapt_threshold`; `0` removes the bias. Range: 0.0–10.0. Default: `1.0`. Applies to the `ntsc3d`/`ntsc3dnoadapt` decoders only.
+### motion_threshold (double)
+NTSC 3D: how much the picture may change between frames, at low frequencies and in multiples of the noise measured on each frame, and still count as still. Higher values frame-comb slow motion and slow pans too; lower it if moving edges show dots or hanging colour. Range: 1.0–10.0. Default: `4.0`. Applies to the `ntsc3d` decoder only.
 
-### adapt_threshold (double)
-NTSC 3D adaptive filter threshold. Higher values prefer more of the 3D result. Range: 0.0–10.0. Default: `1.0`. Applies to the `ntsc3d` decoder only.
+### detail_threshold (double)
+NTSC 3D: how badly the 2D comb must fail, in multiples of its noise, before the frame comb is used. Lower values frame-comb more widely, removing more cross-colour from fine still detail but keeping more of the capture's noise as a fine dot pattern in flat areas; `0` frame-combs wherever the picture is still. Range: 0.0–10.0. Default: `2.0`. Applies to the `ntsc3d` decoder only.
 
 ### output_padding (int)
 Pad the output frame to a multiple of this many pixels on both axes. Range: 1–32. Default: `8`. Ignored by `mkv-ffv1-bt601`, whose width is fixed at the BT.601 720.

@@ -264,34 +264,36 @@ trails, or to halve the SECAM decoding time.
 |---|---|---|---|
 | `ntsc1d` | Uses a line-local band-pass separation. It cannot distinguish luma detail at the subcarrier frequency from chroma very well. | Diagnostic renders, rapid comparisons, or a fallback when no spatial/temporal comparison is wanted. | Usually the weakest colour quality: dot crawl and cross-colour/luma leakage are expected. |
 | `ntsc2d` | Uses an adaptive three-line comb within the field, comparing the neighbouring lines before blending them. | The general starting point and the current NTSC default. It gives a substantial improvement over 1D without temporal processing. | Cannot use matching information from adjacent fields or frames. |
-| `ntsc3d` | Builds on the 1D and 2D results, then adaptively selects the best matching candidate from nearby lines, fields, and frames. | Static or slowly changing content, animation, and quality-focused renders where the additional compute cost is acceptable. | Requires surrounding frames and is slower. The adaptive chooser is designed to avoid bad temporal matches, but moving material must still be checked for artefacts. |
+| `ntsc3d` | Motion adaptive: a frame comb against the neighbouring frames where the picture is still and a 2D comb would mistake luma detail for chroma; elsewhere a 2D line comb that follows each edge's own slope. | Static or slowly changing content, animation, and quality-focused renders where the additional compute cost is acceptable. | Reads two frames either side and is slower. Motion, flashes and scene cuts fall back to the 2D comb, but moving material should still be checked for artefacts. |
 | `ntsc3dnoadapt` | Performs 3D separation against the previous frame without the adaptive candidate selection. | Controlled comparisons, debugging, or unusually stable content where you intentionally want the fixed previous-frame behaviour. | Motion or a bad previous frame can turn luma differences into colour artefacts. It is not the normal quality choice. |
 
-The 3D mode does not blindly average whole frames. For each sample, the
-adaptive mode evaluates spatial and temporal candidates and can retain the 2D
-result when it is the better match. `ntsc3dnoadapt` disables that protection and
-always uses the previous-frame candidate.
+The 3D mode does not blindly average whole frames. For each sample it decides
+how still the picture is against each neighbouring frame, measured against the
+capture's own noise (taken from the sync tip and colour burst, which motion
+cannot touch), and frame-combs only where the picture is still and the 2D comb
+would get it wrong: where the 2D comb's chroma does not invert cleanly from
+line to line, as chroma does. Flat areas, which the 2D comb already separates
+correctly, keep the 2D result, whose noise is smoother. Frames two away (the
+same chroma phase) confirm that detail is still and catch flashes and colour
+that changes from frame to frame. `ntsc3dnoadapt` disables all of this and
+always frame-combs against the previous frame.
 
 ### NTSC 3D controls
 
-Both controls are offered only in NTSC projects, range from `0.0` to `10.0`,
-and default to `1.0`.
+Both controls are offered only in NTSC projects and apply only to `ntsc3d`.
+Both are measured in multiples of the noise the decoder measures on each
+frame, so the defaults suit quiet and noisy captures alike.
 
-`adapt_threshold` applies only to `ntsc3d`. Higher values strengthen the
-candidate selector's bias toward non-1D candidates, including candidates from
-nearby fields and frames. Keep the default `1.0` initially. Lower it if a
-comparison suggests that motion is being treated as temporally similar;
-increase it only when representative moving material remains clean and the
-extra temporal separation is visibly useful.
+`motion_threshold` (`1.0`–`10.0`, default `4.0`) is how much the picture may
+change between frames, at low frequencies, and still count as still. Raise it
+to frame-comb slow motion and slow pans too; lower it if moving edges show
+dots or hanging colour.
 
-`chroma_weight` is an advanced implementation control, not a saturation
-control. In the current adaptive implementation it scales the same
-spatial/temporal candidate preference used by `adapt_threshold`, so raising
-it has the same effect as raising `adapt_threshold`: line, field and frame
-candidates are favoured more strongly over the same-line 1D ones. It is best
-left at its default `1.0` unless you are comparing renders on both static and
-moving material. It has no practical effect with `ntsc3dnoadapt`, because that
-mode bypasses candidate selection and always chooses the previous frame.
+`detail_threshold` (`0.0`–`10.0`, default `2.0`) is how badly the 2D comb must
+fail before the frame comb is used. Lower values frame-comb more widely, which
+removes more cross-colour from fine still detail but keeps more of the
+capture's noise as a fine dot pattern in flat areas; `0` frame-combs wherever
+the picture is still. Raise it if flat still areas look grainy.
 
 ## Shared controls
 

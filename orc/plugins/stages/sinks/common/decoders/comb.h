@@ -18,8 +18,10 @@
 #include <fstream>
 #include <iostream>
 
+#include "comb_plane.h"
 #include "componentframe.h"
 #include "decoder.h"
+#include "ntsc3d_comb.h"
 #include "sourcefield.h"
 
 class Comb {
@@ -37,17 +39,20 @@ class Comb {
     double chromaGain = 1.0;
     double chromaPhase = 0.0;
     int32_t dimensions = 2;
+    // 3D only: motion adaptive (ntsc3d), or always against the previous
+    // frame (ntsc3dnoadapt).
     bool adaptive = true;
-    bool showMap = false;
     bool phaseCompensation = false;
 
-    // Adaptation sensitivity for 3D filter (higher = prefer 3D, lower = prefer
-    // 1D/2D)
-    double adaptThreshold = 1.0;
+    // Adaptive 3D only: low-frequency luma change, in multiples of the
+    // measured noise floor, still counted as still (higher frame-combs slower
+    // motion too).
+    double motionThreshold = 4.0;
 
-    // Chroma weight for 3D adaptive filter (higher = prefer more 2D, lower =
-    // prefer more 3D)
-    double chromaWeight = 1.0;
+    // Adaptive 3D only: how far the 2D comb's chroma must fail to invert from
+    // line to line, in multiples of its noise, before the frame comb is used
+    // (lower frame-combs more widely; 0 wherever the picture is still).
+    double detailThreshold = 2.0;
 
     int32_t getLookBehind() const;
     int32_t getLookAhead() const;
@@ -98,8 +103,22 @@ class Comb {
 
     void split1D();
     void split2D();
-    void split3D(const FrameBuffer& previousFrame,
-                 const FrameBuffer& nextFrame);
+
+    // 3D against the previous frame alone (ntsc3dnoadapt).
+    void splitPreviousFrame(const FrameBuffer& previousFrame);
+
+    // Motion-adaptive 3D (ntsc3d) from the frames up to two either side;
+    // nullptr where a frame cannot be used.
+    void splitAdaptive3D(const FrameBuffer* before2, const FrameBuffer* before,
+                         const FrameBuffer* after, const FrameBuffer* after2);
+
+    // Whether this frame can stand |offset| frames from |current| in a 3D
+    // comb: it was loaded, is not blank padding, and (where the field phases
+    // are known) has the chroma phase that offset implies.
+    bool usableAround(const FrameBuffer& current, int32_t offset) const;
+
+    // No frame loaded into this buffer for the current position.
+    void markAbsent() { present = false; }
 
     void setComponentFrame(ComponentFrame& _componentFrame) {
       componentFrame = &_componentFrame;
@@ -116,9 +135,6 @@ class Comb {
     void filterIQFull();
     void adjustY();
     void transformIQ(double chromaGain, double chromaPhase);
-
-    void overlayMap(const FrameBuffer& previousFrame,
-                    const FrameBuffer& nextFrame);
 
    private:
     const ::orc::SourceParameters& videoParameters;
@@ -140,6 +156,15 @@ class Comb {
     std::vector<int16_t> chroma_buffer;
     bool is_yc = false;  // True if loaded from YC source
 
+    // Whether a frame is loaded, and whether it is uniform (the blank fields
+    // a sink pads a sequence's ends with).
+    bool present = false;
+    bool blank = false;
+
+    // Adaptive 3D only: the composite as doubles in field-separated rows.
+    ntsc_comb::FieldLayout layout;
+    ntsc_comb::Plane flat;
+
     // Per-field phase id (1-4) of the frame's two fields, measured from the
     // burst by the colour_frame_phase observer; -1 unknown.  getLinePhase()
     // needs the per-field value: the two fields of a frame have opposite
@@ -152,24 +177,11 @@ class Comb {
       double pixel[MAX_HEIGHT][MAX_WIDTH];
     } clpbuffer[3];
 
-    // Result of evaluating a 3D candidate
-    struct Candidate {
-      double penalty;
-      double sample;
-    };
-
     // The component frame for output (if there is one)
     ComponentFrame* componentFrame;
 
     inline int32_t getFieldID(int32_t lineNumber) const;
     inline bool getLinePhase(int32_t lineNumber) const;
-    void getBestCandidate(int32_t lineNumber, int32_t h,
-                          const FrameBuffer& previousFrame,
-                          const FrameBuffer& nextFrame, int32_t& bestIndex,
-                          double& bestSample) const;
-    Candidate getCandidate(int32_t refLineNumber, int32_t refH,
-                           const FrameBuffer& frameBuffer, int32_t lineNumber,
-                           int32_t h, double adjustPenalty) const;
 
     // Helper to demodulate chroma with phase compensation (shared between
     // composite and YC)

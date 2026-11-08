@@ -202,8 +202,8 @@ class VideoSinkStage : public DAGStage,
     bool secam_field_identification;
     bool blackandwhite;
     double transform_threshold;
-    double chroma_weight;
-    double adapt_threshold;
+    double motion_threshold;
+    double detail_threshold;
 
     // Built on first use; a type whose decoder could not be built (it does
     // not suit the source) holds nullptr.
@@ -211,13 +211,13 @@ class VideoSinkStage : public DAGStage,
     bool configured = false;
 
     bool matches_config(const std::string& selection, double cg, double cp,
-                        bool npc, bool sp, bool bw, double tt, double cw,
-                        double at, bool stc, bool sccs, bool sfi) const {
+                        bool npc, bool sp, bool bw, double tt, double mt,
+                        double dt, bool stc, bool sccs, bool sfi) const {
       return configured && decoder_selection == selection &&
              chroma_gain == cg && chroma_phase == cp &&
              ntsc_phase_comp == npc && simple_pal == sp &&
              blackandwhite == bw && transform_threshold == tt &&
-             chroma_weight == cw && adapt_threshold == at &&
+             motion_threshold == mt && detail_threshold == dt &&
              secam_temporal_chroma == stc &&
              secam_cross_colour_suppression == sccs &&
              secam_field_identification == sfi;
@@ -290,8 +290,8 @@ class VideoSinkStage : public DAGStage,
   bool secam_cross_colour_suppression_;
   bool secam_field_identification_;
   double transform_threshold_;
-  double chroma_weight_;
-  double adapt_threshold_;
+  double motion_threshold_;
+  double detail_threshold_;
   int output_padding_;
   bool embed_audio_;  // Embed pipeline audio in output (MP4/MKV only)
   std::string audio_channel_pairs_;  // "all" or comma-separated 0-based
