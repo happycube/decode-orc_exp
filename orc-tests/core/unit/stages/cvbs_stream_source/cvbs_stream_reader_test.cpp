@@ -168,7 +168,9 @@ TEST(CVBSStreamReaderTest, ConcurrentRequests_AllSucceed) {
                                /*blanking_10bit=*/0);
 
   std::vector<std::thread> workers;
-  std::vector<bool> ok(kFrameCount, false);
+  // One byte per frame: std::vector<bool> packs its flags into shared words,
+  // so workers setting different frames' flags would race.
+  std::vector<char> ok(kFrameCount, 0);
   for (size_t t = 0; t < 8; ++t) {
     workers.emplace_back([&, t] {
       for (size_t id = t; id < kFrameCount; id += 8) {
