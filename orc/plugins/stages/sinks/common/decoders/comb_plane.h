@@ -87,17 +87,27 @@ inline std::vector<std::vector<Sample>>& store() {
   return buffers;
 }
 
-// A buffer of |size| samples, contents unspecified.
+// A buffer of |size| samples, contents unspecified: the most recent kept
+// buffer of that size, or else the smallest that holds it (planes of a
+// cropped frame and of the whole frame share the store).
 inline std::vector<Sample> take(size_t size) {
   auto& buffers = store();
+  auto best = buffers.rend();
   for (auto it = buffers.rbegin(); it != buffers.rend(); ++it) {
     if (it->size() == size) {
-      std::vector<Sample> buffer = std::move(*it);
-      buffers.erase(std::next(it).base());
-      return buffer;
+      best = it;
+      break;
+    }
+    if (it->capacity() >= size &&
+        (best == buffers.rend() || it->capacity() < best->capacity())) {
+      best = it;
     }
   }
-  return std::vector<Sample>(size);
+  if (best == buffers.rend()) return std::vector<Sample>(size);
+  std::vector<Sample> buffer = std::move(*best);
+  buffers.erase(std::next(best).base());
+  buffer.resize(size);
+  return buffer;
 }
 
 inline void give(std::vector<Sample>&& buffer) {
@@ -190,22 +200,23 @@ Plane map(const Plane& a, const Plane& b, F f) {
 // The 1D chroma bandpass [-1/4, 0, 1/2, 0, -1/4] along every line: unity gain
 // at the subcarrier (a quarter of the 4fsc rate), none at DC. The two samples
 // at each end of a line are left at zero.
+inline void bandpassLine(const Sample* in, Sample* o, int32_t cols) {
+  for (int32_t c = 0; c < std::min(2, cols); c++) o[c] = 0.0F;
+  for (int32_t c = std::max(2, cols - 2); c < cols; c++) o[c] = 0.0F;
+  for (int32_t c = 2; c < cols - 2; c++) {
+    const double value =
+        (static_cast<double>(in[c]) -
+         ((static_cast<double>(in[c - 2]) + static_cast<double>(in[c + 2])) /
+          2.0)) /
+        2.0;
+    o[c] = static_cast<Sample>(value);
+  }
+}
+
 inline Plane bandpass(const Plane& x) {
   Plane out(x.rows, x.cols);
-  for (int32_t r = 0; r < x.rows; r++) {
-    const Sample* in = x.row(r);
-    Sample* o = out.row(r);
-    for (int32_t c = 0; c < std::min(2, x.cols); c++) o[c] = 0.0F;
-    for (int32_t c = std::max(2, x.cols - 2); c < x.cols; c++) o[c] = 0.0F;
-    for (int32_t c = 2; c < x.cols - 2; c++) {
-      const double value =
-          (static_cast<double>(in[c]) -
-           ((static_cast<double>(in[c - 2]) + static_cast<double>(in[c + 2])) /
-            2.0)) /
-          2.0;
-      o[c] = static_cast<Sample>(value);
-    }
-  }
+  for (int32_t r = 0; r < x.rows; r++)
+    bandpassLine(x.row(r), out.row(r), x.cols);
   return out;
 }
 
@@ -225,71 +236,188 @@ inline Plane shift(const Plane& x, int32_t lines, int32_t samples) {
   return out;
 }
 
-// The mean of each sample's neighbourhood: |width| samples along the line by
-// |lines| lines of the same field (fields are never mixed), the edges
-// extended. Even widths take one more sample before than after. A width of 4
-// has a null at the subcarrier (and twice it), so boxMean(frame, 4, 1) is the
-// composite with its chroma removed.
-inline Plane boxMean(const Plane& x, int32_t width, int32_t lines,
-                     int32_t field1Rows) {
-  Plane across(x.rows, x.cols);
-  if (width <= 1) {
-    across = x;
-  } else {
-    // A running sum along each line: sample c's window is
-    // [c - before, c - before + width), indices clamped to the line.
-    const int32_t before = width / 2;
-    const int32_t last = x.cols - 1;
-    const auto count = static_cast<double>(width);
-    for (int32_t r = 0; r < x.rows; r++) {
-      const Sample* in = x.row(r);
-      Sample* o = across.row(r);
-      double total = 0.0;
-      for (int32_t k = -before; k < width - before; k++) {
-        total += static_cast<double>(in[std::clamp(k, 0, last)]);
-      }
-      o[0] = static_cast<Sample>(total / count);
-      for (int32_t c = 1; c < x.cols; c++) {
-        total += static_cast<double>(
-                     in[std::clamp(c - before + width - 1, 0, last)]) -
-                 static_cast<double>(in[std::clamp(c - 1 - before, 0, last)]);
-        o[c] = static_cast<Sample>(total / count);
-      }
+// The mean of |width| samples of a line around each sample, the line's ends
+// extended: sample c's window is [c - width / 2, c - width / 2 + width).
+// Each window is summed afresh (no running sum), so the samples are
+// independent and the compiler can vectorise across them.
+template <int32_t Width>
+void boxAlongLine(const Sample* in, Sample* out, int32_t cols) {
+  constexpr int32_t kBefore = Width / 2;
+  const int32_t last = cols - 1;
+  const auto count = static_cast<double>(Width);
+  auto clamped = [&](int32_t c) {
+    double total = 0.0;
+    for (int32_t k = c - kBefore; k < c - kBefore + Width; k++) {
+      total += static_cast<double>(in[std::clamp(k, 0, last)]);
     }
+    out[c] = static_cast<Sample>(total / count);
+  };
+  // Samples whose window lies inside the line
+  const int32_t first = std::min(kBefore, cols);
+  const int32_t end = std::max(first, cols - Width + kBefore + 1);
+  for (int32_t c = 0; c < first; c++) clamped(c);
+  for (int32_t c = first; c < end; c++) {
+    const Sample* window = in + (c - kBefore);
+    double total = 0.0;
+    for (int32_t k = 0; k < Width; k++) {
+      total += static_cast<double>(window[k]);
+    }
+    out[c] = static_cast<Sample>(total / count);
   }
-  if (lines <= 1) return across;
+  for (int32_t c = end; c < cols; c++) clamped(c);
+}
 
-  Plane out(x.rows, x.cols);
+inline void boxAlongLine(const Sample* in, Sample* out, int32_t cols,
+                         int32_t width) {
+  switch (width) {
+    case 4:
+      boxAlongLine<4>(in, out, cols);
+      return;
+    case 5:
+      boxAlongLine<5>(in, out, cols);
+      return;
+    case 9:
+      boxAlongLine<9>(in, out, cols);
+      return;
+    default:
+      break;
+  }
+  // Other widths: a running sum
+  if (width <= 1) {
+    std::copy(in, in + cols, out);
+    return;
+  }
+  const int32_t before = width / 2;
+  const int32_t last = cols - 1;
+  const auto count = static_cast<double>(width);
+  double total = 0.0;
+  for (int32_t k = -before; k < width - before; k++) {
+    total += static_cast<double>(in[std::clamp(k, 0, last)]);
+  }
+  out[0] = static_cast<Sample>(total / count);
+  for (int32_t c = 1; c < cols; c++) {
+    total +=
+        static_cast<double>(in[std::clamp(c - before + width - 1, 0, last)]) -
+        static_cast<double>(in[std::clamp(c - 1 - before, 0, last)]);
+    out[c] = static_cast<Sample>(total / count);
+  }
+}
+
+// The mean of each sample's neighbourhood in a plane of |rows| x |cols|:
+// |width| samples along the line by |lines| lines of the same field (fields
+// are never mixed), the edges extended. Even widths take one more sample
+// before than after. A width of 4 has a null at the subcarrier (and twice
+// it), so a 4 x 1 box of a frame is the composite with its chroma removed.
+//
+// The plane averaged is never stored: |input|(r, scratch) gives its row r,
+// returning either a row it already holds or |scratch| (|cols| samples)
+// after writing the row there. Each row is asked for once, as the lines'
+// windows reach it, and only the |lines| rows a window needs are kept.
+template <typename RowSource>
+Plane boxMeanOf(int32_t rows, int32_t cols, int32_t width, int32_t lines,
+                int32_t field1Rows, RowSource input) {
+  Plane out(rows, cols);
+  std::vector<Sample> scratch(static_cast<size_t>(cols));
+  if (lines <= 1) {
+    for (int32_t r = 0; r < rows; r++) {
+      boxAlongLine(input(r, scratch.data()), out.row(r), cols, width);
+    }
+    return out;
+  }
+
+  // The window's rows, averaged along the line, each in slot (row % slots).
+  const int32_t slots = lines + 1;
+  std::vector<Sample> across(static_cast<size_t>(slots) * cols);
+  std::vector<int32_t> held(static_cast<size_t>(slots), -1);
+  auto acrossRow = [&](int32_t k) -> const Sample* {
+    const auto slot = static_cast<size_t>(k % slots);
+    Sample* row = across.data() + (slot * cols);
+    if (held[slot] != k) {
+      boxAlongLine(input(k, scratch.data()), row, cols, width);
+      held[slot] = k;
+    }
+    return row;
+  };
+
   const int32_t before = lines / 2;
   const auto count = static_cast<double>(lines);
-  std::vector<double> sum(static_cast<size_t>(x.cols));
+  std::vector<const Sample*> window(static_cast<size_t>(lines));
   auto field = [&](int32_t first, int32_t end) {
     for (int32_t r = first; r < end; r++) {
-      std::fill(sum.begin(), sum.end(), 0.0);
-      for (int32_t k = r - before; k < r - before + lines; k++) {
-        const Sample* in = across.row(std::clamp(k, first, end - 1));
-        for (int32_t c = 0; c < x.cols; c++) {
-          sum[c] += static_cast<double>(in[c]);
-        }
+      for (int32_t k = 0; k < lines; k++) {
+        window[k] = acrossRow(std::clamp(r - before + k, first, end - 1));
       }
       Sample* o = out.row(r);
-      for (int32_t c = 0; c < x.cols; c++) {
-        o[c] = static_cast<Sample>(sum[c] / count);
+      for (int32_t c = 0; c < cols; c++) {
+        double total = 0.0;
+        for (int32_t k = 0; k < lines; k++) {
+          total += static_cast<double>(window[k][c]);
+        }
+        o[c] = static_cast<Sample>(total / count);
       }
     }
   };
   field(0, field1Rows);
-  field(field1Rows, x.rows);
+  field(field1Rows, rows);
   return out;
 }
 
-// The local mean of |x| for a chroma-band signal, over whole subcarrier
+// boxMeanOf a whole plane.
+inline Plane boxMean(const Plane& x, int32_t width, int32_t lines,
+                     int32_t field1Rows) {
+  return boxMeanOf(x.rows, x.cols, width, lines, field1Rows,
+                   [&](int32_t r, Sample*) { return x.row(r); });
+}
+
+// The local mean of |f(row)| for a chroma-band signal, over whole subcarrier
 // cycles (4 samples) by 3 lines: |x| alternates between the I and Q samples,
 // so a box of odd width would ripple from one sample to the next, and so
-// would every weight taken from it.
+// would every weight taken from it. |row|(r, scratch) gives the signal's row
+// r as boxMeanOf's input does.
+template <typename RowSource>
+Plane cycleMeanOf(int32_t rows, int32_t cols, int32_t field1Rows,
+                  RowSource row) {
+  return boxMeanOf(rows, cols, 4, 3, field1Rows,
+                   [&](int32_t r, Sample* scratch) {
+                     const Sample* in = row(r, scratch);
+                     for (int32_t c = 0; c < cols; c++) {
+                       scratch[c] = std::fabs(in[c]);
+                     }
+                     return static_cast<const Sample*>(scratch);
+                   });
+}
+
 inline Plane cycleMean(const Plane& x, int32_t field1Rows) {
-  return boxMean(map(x, [](double s) { return std::fabs(s); }), 4, 3,
-                 field1Rows);
+  return cycleMeanOf(x.rows, x.cols, field1Rows,
+                     [&](int32_t r, Sample*) { return x.row(r); });
+}
+
+// The rows [first1, end1) and [first2, end2) of |x| (the two fields' parts of
+// a frame) as a plane of their own: the first range's rows, then the
+// second's, and samples [0, cols) of each.
+inline Plane cropRows(const Plane& x, int32_t first1, int32_t end1,
+                      int32_t first2, int32_t end2, int32_t cols) {
+  Plane out((end1 - first1) + (end2 - first2), cols);
+  int32_t o = 0;
+  for (int32_t r = first1; r < end1; r++) {
+    std::copy(x.row(r), x.row(r) + cols, out.row(o++));
+  }
+  for (int32_t r = first2; r < end2; r++) {
+    std::copy(x.row(r), x.row(r) + cols, out.row(o++));
+  }
+  return out;
+}
+
+// The inverse: |part| written back over the same rows and samples of |x|.
+inline void pasteRows(const Plane& part, int32_t first1, int32_t end1,
+                      int32_t first2, int32_t end2, Plane& x) {
+  int32_t o = 0;
+  for (int32_t r = first1; r < end1; r++, o++) {
+    std::copy(part.row(o), part.row(o) + part.cols, x.row(r));
+  }
+  for (int32_t r = first2; r < end2; r++, o++) {
+    std::copy(part.row(o), part.row(o) + part.cols, x.row(r));
+  }
 }
 
 // The |q|th percentile of |values| (0..100), interpolating linearly between

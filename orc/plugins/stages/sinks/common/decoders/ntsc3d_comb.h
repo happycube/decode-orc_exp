@@ -73,7 +73,9 @@ class Ntsc3dComb {
   };
 
   struct Result {
-    Plane chroma;           // the current frame's chroma, whole frame
+    // The current frame's chroma, whole frame: the 2D comb's beyond a few
+    // lines and samples of the picture.
+    Plane chroma;
     Plane frameCombWeight;  // 0 (2D comb) .. 1 (frame comb), per sample
   };
 

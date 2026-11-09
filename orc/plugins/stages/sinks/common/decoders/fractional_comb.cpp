@@ -281,10 +281,15 @@ Plane FractionalComb::separate(const Plane& frame, const FieldLayout& layout,
       }
       const double xx = jxx.at(r, c), xy = jxy.at(r, c), yy = jyy.at(r, c);
       const double trace = xx + yy + kFlatEnergy;
-      const double coherence =
-          std::sqrt(((xx - yy) * (xx - yy)) + (4.0 * xy * xy)) / trace;
-      const double theta = 0.5 * std::atan2(2.0 * xy, xx - yy);
-      double slope = std::tan(theta);
+      const double a = xx - yy;
+      const double b = 2.0 * xy;
+      const double spread = std::sqrt((a * a) + (b * b));
+      const double coherence = spread / trace;
+      // The slope is tan(atan2(b, a) / 2), by the half-angle identity
+      // b / (spread + a), or (spread - a) / b, the same value without the
+      // cancellation, where a < 0. With no gradient (a = b = 0) it is NaN:
+      // no direction, so none taken.
+      double slope = (a >= 0.0) ? b / (spread + a) : (spread - a) / b;
       if (std::isnan(slope)) slope = 0.0;
 
       // The two nearest filters and the weight between them.
