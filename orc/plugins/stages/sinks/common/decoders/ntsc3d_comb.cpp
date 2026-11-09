@@ -240,9 +240,9 @@ double chromaNoiseSlope(const std::vector<const Plane*>& changes, double floor,
                     kPictureNoiseMax * *disc);
 }
 
-// The part of a frame the 3D comb works on (see kMarginLines), as a plane of
-// its own: the first field's lines [first1, end1), then the second's
-// [first2, end2), each samples [0, cols).
+// The part of a frame the 3D comb works on (see kMarginLines): the first
+// field's lines [first1, end1), then the second's [first2, end2), each
+// samples [0, layout.cols).
 struct Crop {
   int32_t first1 = 0, end1 = 0, first2 = 0, end2 = 0;
   FieldLayout layout;
@@ -264,33 +264,52 @@ struct Crop {
     picture.field2End += layout.field1Rows - first2;
   }
 
-  Plane of(const Plane& x) const {
-    return cropRows(x, first1, end1, first2, end2, layout.cols);
-  }
   // The frame's row for the crop's row |r|.
   int32_t frameRow(int32_t r) const {
     return (r < layout.field1Rows) ? first1 + r
                                    : first2 + (r - layout.field1Rows);
   }
-  // |part| written back over the frame |x| it was cropped from.
-  void paste(const Plane& part, Plane& x) const {
-    pasteRows(part, first1, end1, first2, end2, x);
-  }
 };
 
-// The 3D comb on the frames cropped by |crop|; |frameLine| is the 2D comb's
-// chroma, the whole frame.
-Ntsc3dComb::Result separateCropped(const Ntsc3dComb::Frames& frames,
-                                   const Plane& frameLine, const Crop& crop,
-                                   const Ntsc3dComb::Settings& settings) {
+// A whole frame's rows as the crop numbers them, read in place.
+class CropRows {
+ public:
+  CropRows(const Plane& frame, const Crop& crop)
+      : rows_(static_cast<size_t>(crop.layout.rows)) {
+    for (int32_t r = 0; r < crop.layout.rows; r++) {
+      rows_[r] = frame.row(crop.frameRow(r));
+    }
+  }
+  const Sample* row(int32_t r) const { return rows_[r]; }
+
+ private:
+  std::vector<const Sample*> rows_;
+};
+
+struct CropFrames {
+  const CropRows* before2 = nullptr;
+  const CropRows* before = nullptr;
+  const CropRows* current = nullptr;
+  const CropRows* after = nullptr;
+  const CropRows* after2 = nullptr;
+};
+
+// The 3D comb over the crop, written into |result| (whole-frame planes):
+// result.chroma holds the 2D comb's chroma on entry, frameCombWeight zero.
+//
+// The measures are reduced, as soon as all they feed is known, to the few
+// factors the final blend needs, and dropped: only some 16 planes of the crop
+// are held at once.
+void separateCropped(const CropFrames& frames, const Crop& crop,
+                     const Ntsc3dComb::Settings& settings,
+                     Ntsc3dComb::Result& result) {
   const FieldLayout& layout = crop.layout;
   const ActivePicture& picture = crop.picture;
-  const Plane line = crop.of(frameLine);
-  const Plane& current = *frames.current;
-  const Plane* before = frames.before;
-  const Plane* after = frames.after;
-  const Plane* before2 = frames.before2;
-  const Plane* after2 = frames.after2;
+  const CropRows& current = *frames.current;
+  const CropRows* before = frames.before;
+  const CropRows* after = frames.after;
+  const CropRows* before2 = frames.before2;
+  const CropRows* after2 = frames.after2;
   const int32_t rows = layout.rows;
   const int32_t cols = layout.cols;
   const int32_t f1 = layout.field1Rows;
@@ -327,7 +346,7 @@ Ntsc3dComb::Result separateCropped(const Ntsc3dComb::Frames& frames,
       return static_cast<const Sample*>(o);
     });
   };
-  auto lumaChange = [&](const Plane& a, const Plane& b) {
+  auto lumaChange = [&](const CropRows& a, const CropRows& b) {
     return lumaChangeOf([&](int32_t r, Sample* d) {
       const Sample* pa = a.row(r);
       const Sample* pb = b.row(r);
@@ -337,7 +356,7 @@ Ntsc3dComb::Result separateCropped(const Ntsc3dComb::Frames& frames,
   // Change in the chroma band: chroma-free only between frames of the same
   // chroma phase (two apart). Sees the fine, thin detail the 4-sample mean
   // blurs away.
-  auto detailChange = [&](const Plane& a, const Plane& b) {
+  auto detailChange = [&](const CropRows& a, const CropRows& b) {
     return boxMeanOf(rows, cols, 4, 3, f1, [&](int32_t r, Sample* o) {
       const Sample* pa = a.row(r);
       const Sample* pb = b.row(r);
@@ -356,7 +375,7 @@ Ntsc3dComb::Result separateCropped(const Ntsc3dComb::Frames& frames,
   };
   // Change over the whole signal: chroma-free only between frames of the
   // same chroma phase.
-  auto fullChange = [&](const Plane& a, const Plane& b) {
+  auto fullChange = [&](const CropRows& a, const CropRows& b) {
     return cycleMeanOf(rows, cols, f1, [&](int32_t r, Sample* o) {
       const Sample* pa = a.row(r);
       const Sample* pb = b.row(r);
@@ -364,48 +383,8 @@ Ntsc3dComb::Result separateCropped(const Ntsc3dComb::Frames& frames,
       return static_cast<const Sample*>(o);
     });
   };
-
-  const Plane now = bandpass(current);
-  const size_t n = now.v.size();
-
-  // Each neighbour's frame comb, and how much the low-frequency luma changed
-  // from it.
-  // Planes computed only where their frames exist are held here; the pointers
-  // below are null where they do not.
-  Plane fromBeforePlane, fromAfterPlane, lumaBeforePlane, lumaAfterPlane;
-  const Plane* fromBefore = nullptr;
-  const Plane* fromAfter = nullptr;
-  const Plane* lumaBefore = nullptr;
-  const Plane* lumaAfter = nullptr;
-  auto frameComb = [&](const Plane& other) {
-    Plane out(rows, cols);
-    std::vector<Sample> band(static_cast<size_t>(cols));
-    for (int32_t r = 0; r < rows; r++) {
-      bandpassLine(other.row(r), band.data(), cols);
-      const Sample* x = now.row(r);
-      Sample* o = out.row(r);
-      for (int32_t c = 0; c < cols; c++) {
-        o[c] = static_cast<Sample>((static_cast<double>(x[c]) - band[c]) / 2.0);
-      }
-    }
-    return out;
-  };
-  if (before != nullptr) {
-    fromBeforePlane = frameComb(*before);
-    lumaBeforePlane = lumaChange(current, *before);
-    fromBefore = &fromBeforePlane;
-    lumaBefore = &lumaBeforePlane;
-  }
-  if (after != nullptr) {
-    fromAfterPlane = frameComb(*after);
-    lumaAfterPlane = lumaChange(current, *after);
-    fromAfter = &fromAfterPlane;
-    lumaAfter = &lumaAfterPlane;
-  }
-
-  // Low-frequency changes between the frame pairs the floor is taken from.
   // A change measure between two frames, or null where either is missing.
-  auto changeIf = [](const Plane* a, const Plane* b, Plane& storage,
+  auto changeIf = [](const CropRows* a, const CropRows* b, Plane& storage,
                      const auto& measure) -> const Plane* {
     if (a == nullptr || b == nullptr) return nullptr;
     storage = measure(*a, *b);
@@ -418,7 +397,41 @@ Ntsc3dComb::Result separateCropped(const Ntsc3dComb::Frames& frames,
     }
     return out;
   };
-  Plane lumaBAPlane, lumaB2Plane, lumaA2Plane;
+
+  // The current frame's chroma band, and a frame comb against another frame.
+  Plane now(rows, cols);
+  for (int32_t r = 0; r < rows; r++) {
+    bandpassLine(current.row(r), now.row(r), cols);
+  }
+  const size_t n = now.v.size();
+  auto frameComb = [&](const CropRows& other) {
+    Plane out(rows, cols);
+    std::vector<Sample> band(static_cast<size_t>(cols));
+    for (int32_t r = 0; r < rows; r++) {
+      bandpassLine(other.row(r), band.data(), cols);
+      const Sample* x = now.row(r);
+      Sample* o = out.row(r);
+      for (int32_t c = 0; c < cols; c++) {
+        o[c] = static_cast<Sample>((static_cast<double>(x[c]) - band[c]) / 2.0);
+      }
+    }
+    return out;
+  };
+  // The result's rows for the crop's row |r|.
+  auto chromaRow = [&](int32_t r) {
+    return result.chroma.row(crop.frameRow(r));
+  };
+  auto weightRow = [&](int32_t r) {
+    return result.frameCombWeight.row(crop.frameRow(r));
+  };
+
+  // How much the low-frequency luma changed from each neighbour, and between
+  // the frame pairs the floor is taken from.
+  Plane lumaBeforePlane, lumaAfterPlane, lumaBAPlane, lumaB2Plane, lumaA2Plane;
+  const Plane* lumaBefore =
+      changeIf(&current, before, lumaBeforePlane, lumaChange);
+  const Plane* lumaAfter =
+      changeIf(&current, after, lumaAfterPlane, lumaChange);
   const Plane* lumaBA = changeIf(before, after, lumaBAPlane, lumaChange);
   const Plane* lumaB2 = changeIf(&current, before2, lumaB2Plane, lumaChange);
   const Plane* lumaA2 = changeIf(&current, after2, lumaA2Plane, lumaChange);
@@ -428,47 +441,30 @@ Ntsc3dComb::Result separateCropped(const Ntsc3dComb::Frames& frames,
   // Noise in the chroma band rises with its amplitude, so each floor does
   // too, from frame pairs of the same chroma phase.
   const Plane amplitude = cycleMean(now, f1);
-  const auto samePhaseLuma = present({lumaB2, lumaA2, lumaBA});
-  const double lumaSlope =
-      chromaNoiseSlope(samePhaseLuma, baseFloor, amplitude, regions);
+  const double lumaSlope = chromaNoiseSlope(present({lumaB2, lumaA2, lumaBA}),
+                                            baseFloor, amplitude, regions);
   auto floorAt = [&](size_t i) {
     return baseFloor + (amplitude.v[i] * lumaSlope);
   };
 
-  Ntsc3dComb::Result result;
-  result.chroma = Plane(rows, cols);
-  result.frameCombWeight = Plane(rows, cols);
-  if (fromBefore == nullptr || fromAfter == nullptr) {
+  if (before == nullptr || after == nullptr) {
     // The first or last frame of a sequence: the one neighbour's frame comb
     // where the picture is still against it.
-    const Plane& estimate = (fromBefore != nullptr) ? *fromBefore : *fromAfter;
-    const Plane& change = (fromBefore != nullptr) ? *lumaBefore : *lumaAfter;
-    for (size_t i = 0; i < n; i++) {
-      const double s = stillWeight(change.v[i], lumaK * floorAt(i));
-      result.chroma.v[i] =
-          static_cast<Sample>((s * estimate.v[i]) + ((1.0 - s) * line.v[i]));
-      result.frameCombWeight.v[i] = static_cast<Sample>(s);
+    const Plane estimate = frameComb((before != nullptr) ? *before : *after);
+    const Plane& change = (before != nullptr) ? *lumaBefore : *lumaAfter;
+    for (int32_t r = 0; r < rows; r++) {
+      Sample* chroma = chromaRow(r);
+      Sample* weight = weightRow(r);
+      for (int32_t c = 0; c < cols; c++) {
+        const size_t i = regions.index(r, c);
+        const double s = stillWeight(change.v[i], lumaK * floorAt(i));
+        chroma[c] =
+            static_cast<Sample>((s * estimate.v[i]) + ((1.0 - s) * chroma[c]));
+        weight[c] = static_cast<Sample>(s);
+      }
     }
-    return result;
+    return;
   }
-
-  Plane detailB2Plane, detailA2Plane, detailBAPlane, detailTwosPlane;
-  const Plane* detailB2 =
-      changeIf(&current, before2, detailB2Plane, detailChange);
-  const Plane* detailA2 =
-      changeIf(&current, after2, detailA2Plane, detailChange);
-  const Plane* detailBA = changeIf(before, after, detailBAPlane, detailChange);
-  // The frames two away against each other: how far apart they are in the
-  // chroma band (noise, on a still picture).
-  const Plane* detailTwos =
-      changeIf(before2, after2, detailTwosPlane, detailChange);
-  const auto samePhaseDetail = present({detailB2, detailA2, detailBA});
-  const double detailFloor = noiseFloor(samePhaseDetail, regions);
-  const double detailSlope =
-      chromaNoiseSlope(samePhaseDetail, detailFloor, amplitude, regions);
-  auto detailFloorAt = [&](size_t i) {
-    return detailFloor + (amplitude.v[i] * detailSlope);
-  };
 
   // Colour edges: a still neighbour's chroma is the current frame's,
   // inverted, so comparing the two leaves twice the chroma, and the 4-sample
@@ -511,6 +507,86 @@ Ntsc3dComb::Result separateCropped(const Ntsc3dComb::Frames& frames,
     return stillWeight(change.v[i], (lumaK * floorAt(i)) + allowance.v[i]);
   };
 
+  // Change in the chroma band between frames of the same chroma phase; the
+  // frames two away against each other say how far apart they are (noise,
+  // on a still picture).
+  Plane detailB2Plane, detailA2Plane, detailBAPlane, detailTwosPlane;
+  const Plane* detailB2 =
+      changeIf(&current, before2, detailB2Plane, detailChange);
+  const Plane* detailA2 =
+      changeIf(&current, after2, detailA2Plane, detailChange);
+  const Plane* detailBA = changeIf(before, after, detailBAPlane, detailChange);
+  const Plane* detailTwos =
+      changeIf(before2, after2, detailTwosPlane, detailChange);
+  const auto samePhaseDetail = present({detailB2, detailA2, detailBA});
+  const double detailFloor = noiseFloor(samePhaseDetail, regions);
+  const double detailSlope =
+      chromaNoiseSlope(samePhaseDetail, detailFloor, amplitude, regions);
+  auto detailFloorAt = [&](size_t i) {
+    return detailFloor + (amplitude.v[i] * detailSlope);
+  };
+
+  // A flash or a one-frame insert: the previous and next frames match each
+  // other, but the current frame matches neither frame two away (the same
+  // chroma phase, so the whole signal compares, colour included). No frame
+  // comb then. |keep| is 1 where the frame comb may stand, 0 on a flash.
+  Plane keep;
+  if (before2 != nullptr || after2 != nullptr) {
+    Plane fullBAPlane, fullB2Plane, fullA2Plane, lumaTwosPlane;
+    const Plane* fullBA = changeIf(before, after, fullBAPlane, fullChange);
+    const Plane* fullB2 = changeIf(&current, before2, fullB2Plane, fullChange);
+    const Plane* fullA2 = changeIf(&current, after2, fullA2Plane, fullChange);
+    const auto flashChanges = present({fullBA, fullB2, fullA2});
+    const double fullFloor = noiseFloor(flashChanges, regions);
+    const double fullSlope =
+        chromaNoiseSlope(flashChanges, fullFloor, amplitude, regions);
+    // A fainter flash, near the noise floor, passes the thresholds above.
+    // Relative to each other it does not: the frames two away (the current
+    // frame's chroma phase) match each other far better than the current
+    // frame matches either, in the luma or the chroma band. (Still, all are
+    // noise apart; in steady motion the current frame is half as far from
+    // each as they are from each other.)
+    const Plane* lumaTwos =
+        changeIf(before2, after2, lumaTwosPlane, lumaChange);
+    // (Written over the first measure, each sample once read.)
+    for (size_t i = 0; i < n; i++) {
+      const double fullFloorAt = fullFloor + (amplitude.v[i] * fullSlope);
+      auto same = [&](const Plane& full, const Plane& luma) {
+        return std::min(stillWeight(full.v[i], lumaK * fullFloorAt),
+                        stillWeight(luma.v[i], lumaK * floorAt(i)));
+      };
+      const double matched = same(*fullBA, *lumaBA);
+      double consistent = 0.0;
+      if (fullB2 != nullptr) {
+        consistent = std::max(consistent, same(*fullB2, *lumaB2));
+      }
+      if (fullA2 != nullptr) {
+        consistent = std::max(consistent, same(*fullA2, *lumaA2));
+      }
+      double k = 1.0 - (matched * (1.0 - consistent));
+      if (lumaTwos != nullptr) {
+        const double lumaApart =
+            stillWeight(std::min(lumaB2->v[i], lumaA2->v[i]),
+                        kFlashK * std::max(static_cast<double>(lumaTwos->v[i]),
+                                           floorAt(i)));
+        const double detailApart = stillWeight(
+            std::min(detailB2->v[i], detailA2->v[i]),
+            kFlashK * std::max(static_cast<double>(detailTwos->v[i]),
+                               detailFloorAt(i)));
+        k *= std::min(lumaApart, detailApart);
+      }
+      fullBAPlane.v[i] = static_cast<Sample>(k);
+    }
+    keep = std::move(fullBAPlane);
+  } else {
+    keep = Plane(rows, cols, 1.0);
+  }
+  // The luma changes between frame pairs fed only the floors, the allowance
+  // and the flash test.
+  lumaBAPlane = Plane();
+  lumaB2Plane = Plane();
+  lumaA2Plane = Plane();
+
   // Steady motion: the frame is the mean of its neighbours, having moved
   // about as far from each. The two one-sided combs then err in opposite
   // directions and their average cancels (the agreement test below caps the
@@ -521,7 +597,7 @@ Ntsc3dComb::Result separateCropped(const Ntsc3dComb::Frames& frames,
   // frames two away (twice the distance, so twice the tolerance): a field
   // that differs from all four neighbours, a flash passing through, is not
   // steady even where its neighbours' mean happens to come close.
-  auto fromMean = [&](const Plane& a, const Plane& b) {
+  auto fromMean = [&](const CropRows& a, const CropRows& b) {
     return lumaChangeOf([&](int32_t r, Sample* d) {
       const Sample* x = current.row(r);
       const Sample* pa = a.row(r);
@@ -550,69 +626,20 @@ Ntsc3dComb::Result separateCropped(const Ntsc3dComb::Frames& frames,
     }
   }
 
-  // Where both are still, the two frame combs should agree to within noise
-  // and an allowance for slow steady motion, which their average cancels.
-  // Both still also means the previous and next frames match in the chroma
-  // band (they share a chroma phase): luma near the subcarrier, which the
-  // luma test cannot see (a zone plate, fine stripes), moving between them
-  // fails here.
-  const Plane disagreement =
-      cycleMeanOf(rows, cols, f1, [&](int32_t r, Sample* o) {
-        const Sample* b = fromBefore->row(r);
-        const Sample* a = fromAfter->row(r);
-        for (int32_t c = 0; c < cols; c++) o[c] = b[c] - a[c];
-        return static_cast<const Sample*>(o);
-      });
-  Plane bothStill(rows, cols);
+  // Both neighbours may be averaged where both are still, or the picture
+  // moves steadily. Both still also means the previous and next frames match
+  // in the chroma band (they share a chroma phase): luma near the
+  // subcarrier, which the luma test cannot see (a zone plate, fine stripes),
+  // moving between them fails here. (Written over the chroma-band change
+  // between them, which nothing else needs.)
   for (size_t i = 0; i < n; i++) {
-    bothStill.v[i] = static_cast<Sample>(
+    const auto bothStill = static_cast<Sample>(
         still(*lumaBefore, i) * still(*lumaAfter, i) *
         stillWeight(detailBA->v[i], kPairK * detailFloorAt(i)));
+    detailBAPlane.v[i] = std::max(bothStill, steady.v[i]);
   }
-  // Its noise, where the averaged comb would be used (unless that is too
-  // little of the picture to say).
-  double disagreementNoise = 0.0;
-  {
-    std::vector<double> agreeing;
-    size_t grid = 0;
-    regions.forPictureGrid([&](size_t i) {
-      grid++;
-      if (std::max(bothStill.v[i], steady.v[i]) > 0.5) {
-        agreeing.push_back(disagreement.v[i]);
-      }
-    });
-    disagreementNoise = (static_cast<double>(agreeing.size()) >
-                         0.05 * static_cast<double>(grid))
-                            ? percentile(agreeing, kNoisePercentile)
-                            : regions.picture(disagreement, kNoisePercentile);
-  }
-
-  // A flash or a one-frame insert: the previous and next frames match each
-  // other, but the current frame matches neither frame two away (the same
-  // chroma phase, so the whole signal compares, colour included). No frame
-  // comb then.
-  const bool flashTest = before2 != nullptr || after2 != nullptr;
-  Plane fullBAPlane, fullB2Plane, fullA2Plane, lumaTwosPlane;
-  const Plane* fullBA = nullptr;
-  const Plane* fullB2 = nullptr;
-  const Plane* fullA2 = nullptr;
-  const Plane* lumaTwos = nullptr;
-  double fullFloor = 0.0, fullSlope = 0.0;
-  if (flashTest) {
-    fullBA = changeIf(before, after, fullBAPlane, fullChange);
-    fullB2 = changeIf(&current, before2, fullB2Plane, fullChange);
-    fullA2 = changeIf(&current, after2, fullA2Plane, fullChange);
-    const auto flashChanges = present({fullBA, fullB2, fullA2});
-    fullFloor = noiseFloor(flashChanges, regions);
-    fullSlope = chromaNoiseSlope(flashChanges, fullFloor, amplitude, regions);
-    // A fainter flash, near the noise floor, passes the thresholds above.
-    // Relative to each other it does not: the frames two away (the current
-    // frame's chroma phase) match each other far better than the current
-    // frame matches either, in the luma or the chroma band. (Still, all are
-    // noise apart; in steady motion the current frame is half as far from
-    // each as they are from each other.)
-    lumaTwos = changeIf(before2, after2, lumaTwosPlane, lumaChange);
-  }
+  const Plane averageable = std::move(detailBAPlane);
+  detailBA = nullptr;
 
   // Only where needed: where the 2D comb's chroma inverts cleanly from one
   // line of the field to the next, as chroma does, the 2D comb has nothing to
@@ -626,19 +653,116 @@ Ntsc3dComb::Result separateCropped(const Ntsc3dComb::Frames& frames,
   // A, B) passes every test between frames of the same chroma phase. Its
   // noise is held to the sync tip's, like the floors above. (The lines above
   // and below are the frame's, which past a field's last line wrap round to
-  // the next.)
-  const Plane unsure = cycleMeanOf(rows, cols, f1, [&](int32_t r, Sample* o) {
-    const int32_t frameRows = frameLine.rows;
-    const int32_t at = crop.frameRow(r);
-    const Sample* x = frameLine.row(at);
-    const Sample* above = frameLine.row((at - 1 + frameRows) % frameRows);
-    const Sample* below = frameLine.row((at + 1) % frameRows);
-    for (int32_t c = 0; c < cols; c++) {
-      o[c] = static_cast<Sample>(x[c] + ((above[c] + below[c]) / 2.0));
+  // the next.) Needed and not a flash: |keep| becomes their product.
+  {
+    const Plane& frameLine = result.chroma;
+    const Plane unsure = cycleMeanOf(rows, cols, f1, [&](int32_t r, Sample* o) {
+      const int32_t frameRows = frameLine.rows;
+      const int32_t at = crop.frameRow(r);
+      const Sample* x = frameLine.row(at);
+      const Sample* above = frameLine.row((at - 1 + frameRows) % frameRows);
+      const Sample* below = frameLine.row((at + 1) % frameRows);
+      for (int32_t c = 0; c < cols; c++) {
+        o[c] = static_cast<Sample>(x[c] + ((above[c] + below[c]) / 2.0));
+      }
+      return static_cast<const Sample*>(o);
+    });
+    const double unsureNoise = noiseFloor({&unsure}, regions);
+    for (size_t i = 0; i < n; i++) {
+      const double needed =
+          1.0 -
+          stillWeight(unsure.v[i], settings.detailThreshold * unsureNoise);
+      keep.v[i] = static_cast<Sample>(keep.v[i] * needed);
     }
-    return static_cast<const Sample*>(o);
-  });
-  const double unsureNoise = noiseFloor({&unsure}, regions);
+  }
+
+  // One neighbour alone, where only it is still, each against the plain
+  // floor: a bright edge moving past, strong in the chroma band, would
+  // otherwise pass. The luma test cannot see changes in fine detail (a thin
+  // line moving, a flash in one field): the frame beyond the neighbour has
+  // the current frame's chroma phase, so the chroma band compares directly,
+  // and the one-sided comb needs it to match.
+  //
+  // Where needed, the frame comb is kept only where the frames two away (the
+  // current frame's chroma phase) confirm the detail is still there,
+  // relative to how well those two match each other (all noise apart on a
+  // still picture; the picture's floor, which a strong chroma band raises,
+  // is the most allowed). A one-sided comb needs the frame beyond it; the
+  // averaged comb either, or steady motion (which passed its own five-frame
+  // test).
+  //
+  // (Each one-sided weight is written over its neighbour's luma change, and
+  // the averaged comb's confirmation over |steady|.)
+  for (size_t i = 0; i < n; i++) {
+    const double apart =
+        (detailTwos != nullptr)
+            ? std::min(static_cast<double>(detailTwos->v[i]), detailFloorAt(i))
+            : detailFloorAt(i);
+    double oneBefore =
+        stillWeight(lumaBefore->v[i], (lumaK * baseFloor) + allowance.v[i]) *
+        (1.0 - still(*lumaAfter, i));
+    double oneAfter =
+        stillWeight(lumaAfter->v[i], (lumaK * baseFloor) + allowance.v[i]) *
+        (1.0 - still(*lumaBefore, i));
+    double confirmBefore = 0.0;
+    double confirmAfter = 0.0;
+    if (detailB2 != nullptr) {
+      confirmBefore = stillWeight(detailB2->v[i], kConfirmK * apart);
+      oneBefore *= stillWeight(detailB2->v[i], kSideK * detailFloorAt(i)) *
+                   confirmBefore;
+    } else {
+      oneBefore = 0.0;
+    }
+    if (detailA2 != nullptr) {
+      confirmAfter = stillWeight(detailA2->v[i], kConfirmK * apart);
+      oneAfter *=
+          stillWeight(detailA2->v[i], kSideK * detailFloorAt(i)) * confirmAfter;
+    } else {
+      oneAfter = 0.0;
+    }
+    lumaBeforePlane.v[i] = static_cast<Sample>(oneBefore);
+    lumaAfterPlane.v[i] = static_cast<Sample>(oneAfter);
+    steady.v[i] =
+        static_cast<Sample>(std::max(static_cast<double>(steady.v[i]),
+                                     std::max(confirmBefore, confirmAfter)));
+  }
+  const Plane beforeOnly = std::move(lumaBeforePlane);
+  const Plane afterOnly = std::move(lumaAfterPlane);
+  const Plane confirmed = std::move(steady);
+  lumaBefore = lumaAfter = nullptr;
+  allowance = Plane();
+  detailB2Plane = Plane();
+  detailA2Plane = Plane();
+  detailTwosPlane = Plane();
+
+  // Each neighbour's frame comb. Where both are averaged, the two should
+  // agree to within noise and an allowance for slow steady motion, which
+  // their average cancels.
+  const Plane fromBefore = frameComb(*before);
+  const Plane fromAfter = frameComb(*after);
+  now = Plane();
+  const Plane disagreement =
+      cycleMeanOf(rows, cols, f1, [&](int32_t r, Sample* o) {
+        const Sample* b = fromBefore.row(r);
+        const Sample* a = fromAfter.row(r);
+        for (int32_t c = 0; c < cols; c++) o[c] = b[c] - a[c];
+        return static_cast<const Sample*>(o);
+      });
+  // Its noise, where the averaged comb would be used (unless that is too
+  // little of the picture to say).
+  double disagreementNoise = 0.0;
+  {
+    std::vector<double> agreeing;
+    size_t grid = 0;
+    regions.forPictureGrid([&](size_t i) {
+      grid++;
+      if (averageable.v[i] > 0.5) agreeing.push_back(disagreement.v[i]);
+    });
+    disagreementNoise = (static_cast<double>(agreeing.size()) >
+                         0.05 * static_cast<double>(grid))
+                            ? percentile(agreeing, kNoisePercentile)
+                            : regions.picture(disagreement, kNoisePercentile);
+  }
 
   // The weights for each sample, a line at a time: the averaged comb, the
   // one-sided combs. They are then averaged along the line, and blended.
@@ -652,92 +776,11 @@ Ntsc3dComb::Result separateCropped(const Ntsc3dComb::Frames& frames,
       const double agree =
           stillWeight(disagreement.v[i], (kNoiseK * disagreementNoise) +
                                              (kDetailK * amplitude.v[i]));
-      // Both neighbours, averaged: both still, or steady motion.
-      auto both =
-          static_cast<Sample>(std::max(bothStill.v[i], steady.v[i]) * agree);
+      const auto both = static_cast<Sample>(averageable.v[i] * agree);
       const double rest = 1.0 - both;
-      // One neighbour alone, each against the plain floor: a bright edge
-      // moving past, strong in the chroma band, would otherwise pass.
-      const double plainBefore =
-          stillWeight(lumaBefore->v[i], (lumaK * baseFloor) + allowance.v[i]);
-      const double plainAfter =
-          stillWeight(lumaAfter->v[i], (lumaK * baseFloor) + allowance.v[i]);
-      auto beforeOnly = static_cast<Sample>(rest * plainBefore *
-                                            (1.0 - still(*lumaAfter, i)));
-      auto afterOnly = static_cast<Sample>(rest * plainAfter *
-                                           (1.0 - still(*lumaBefore, i)));
-      // The luma test cannot see changes in fine detail (a thin line moving,
-      // a flash in one field): the frame beyond the neighbour has the current
-      // frame's chroma phase, so the chroma band compares directly, and the
-      // one-sided comb needs it to match.
-      if (detailB2 != nullptr) {
-        beforeOnly = static_cast<Sample>(
-            beforeOnly *
-            (stillWeight(detailB2->v[i], kSideK * detailFloorAt(i))));
-      }
-      if (detailA2 != nullptr) {
-        afterOnly = static_cast<Sample>(
-            afterOnly *
-            (stillWeight(detailA2->v[i], kSideK * detailFloorAt(i))));
-      }
-
-      if (flashTest) {
-        const double fullFloorAt = fullFloor + (amplitude.v[i] * fullSlope);
-        auto same = [&](const Plane& full, const Plane& luma) {
-          return std::min(stillWeight(full.v[i], lumaK * fullFloorAt),
-                          stillWeight(luma.v[i], lumaK * floorAt(i)));
-        };
-        const double matched = same(*fullBA, *lumaBA);
-        double consistent = 0.0;
-        if (fullB2 != nullptr) {
-          consistent = std::max(consistent, same(*fullB2, *lumaB2));
-        }
-        if (fullA2 != nullptr) {
-          consistent = std::max(consistent, same(*fullA2, *lumaA2));
-        }
-        double keep = 1.0 - (matched * (1.0 - consistent));
-        if (lumaTwos != nullptr) {
-          const double lumaApart = stillWeight(
-              std::min(lumaB2->v[i], lumaA2->v[i]),
-              kFlashK *
-                  std::max(static_cast<double>(lumaTwos->v[i]), floorAt(i)));
-          const double detailApart = stillWeight(
-              std::min(detailB2->v[i], detailA2->v[i]),
-              kFlashK * std::max(static_cast<double>(detailTwos->v[i]),
-                                 detailFloorAt(i)));
-          keep *= std::min(lumaApart, detailApart);
-        }
-        both = static_cast<Sample>(both * keep);
-        beforeOnly = static_cast<Sample>(beforeOnly * keep);
-        afterOnly = static_cast<Sample>(afterOnly * keep);
-      }
-
-      // Where it is needed, the frame comb is kept only where the frames two
-      // away (the current frame's chroma phase) confirm the detail is still
-      // there, relative to how well those two match each other (all noise
-      // apart on a still picture; the picture's floor, which a strong chroma
-      // band raises, is the most allowed). A one-sided comb needs the frame
-      // beyond it; the averaged comb either, or steady motion (which passed
-      // its own five-frame test).
-      const double needed =
-          1.0 -
-          stillWeight(unsure.v[i], settings.detailThreshold * unsureNoise);
-      const double apart = (detailTwos != nullptr)
-                               ? std::min(static_cast<double>(detailTwos->v[i]),
-                                          detailFloorAt(i))
-                               : detailFloorAt(i);
-      const double confirmBefore =
-          (detailB2 != nullptr) ? stillWeight(detailB2->v[i], kConfirmK * apart)
-                                : 0.0;
-      const double confirmAfter =
-          (detailA2 != nullptr) ? stillWeight(detailA2->v[i], kConfirmK * apart)
-                                : 0.0;
-      wBoth[c] =
-          static_cast<Sample>(both * needed *
-                              std::max(static_cast<double>(steady.v[i]),
-                                       std::max(confirmBefore, confirmAfter)));
-      wBefore[c] = static_cast<Sample>(beforeOnly * (needed * confirmBefore));
-      wAfter[c] = static_cast<Sample>(afterOnly * (needed * confirmAfter));
+      wBoth[c] = static_cast<Sample>(both * keep.v[i] * confirmed.v[i]);
+      wBefore[c] = static_cast<Sample>(rest * beforeOnly.v[i] * keep.v[i]);
+      wAfter[c] = static_cast<Sample>(rest * afterOnly.v[i] * keep.v[i]);
     }
 
     // The weights then change smoothly along the line: switching between the
@@ -749,11 +792,10 @@ Ntsc3dComb::Result separateCropped(const Ntsc3dComb::Frames& frames,
     boxAlongLine<kMaskWidth>(wBefore.data(), smoothBefore, cols);
     boxAlongLine<kMaskWidth>(wAfter.data(), smoothAfter, cols);
 
-    const Sample* fromB = fromBefore->row(r);
-    const Sample* fromA = fromAfter->row(r);
-    const Sample* twoD = line.row(r);
-    Sample* chroma = result.chroma.row(r);
-    Sample* weight = result.frameCombWeight.row(r);
+    const Sample* fromB = fromBefore.row(r);
+    const Sample* fromA = fromAfter.row(r);
+    Sample* chroma = chromaRow(r);  // the 2D comb's, replaced
+    Sample* weight = weightRow(r);
     for (int32_t c = 0; c < cols; c++) {
       const double weightBoth = smoothBoth[c];
       const double weightBefore = smoothBefore[c];
@@ -762,11 +804,10 @@ Ntsc3dComb::Result separateCropped(const Ntsc3dComb::Frames& frames,
       chroma[c] = static_cast<Sample>(
           (weightBoth * (static_cast<double>(fromB[c]) + fromA[c]) / 2.0) +
           (weightBefore * fromB[c]) + (weightAfter * fromA[c]) +
-          ((1.0 - frameComb) * twoD[c]));
+          ((1.0 - frameComb) * chroma[c]));
       weight[c] = static_cast<Sample>(frameComb);
     }
   }
-  return result;
 }
 
 }  // namespace
@@ -783,22 +824,19 @@ Ntsc3dComb::Result Ntsc3dComb::separate(const Frames& frames,
   // The 3D comb works on the picture and a margin round it (see Crop); the
   // 2D comb stands elsewhere.
   const Crop crop(layout, picture);
-  Plane parts[5];
-  auto part = [&](const Plane* frame, Plane& storage) -> const Plane* {
+  std::optional<CropRows> rows[5];
+  auto view = [&](const Plane* frame, int32_t k) -> const CropRows* {
     if (frame == nullptr) return nullptr;
-    storage = crop.of(*frame);
-    return &storage;
+    rows[k].emplace(*frame, crop);
+    return &*rows[k];
   };
-  Frames cropped;
-  cropped.before2 = part(frames.before2, parts[0]);
-  cropped.before = part(frames.before, parts[1]);
-  cropped.current = part(frames.current, parts[2]);
-  cropped.after = part(frames.after, parts[3]);
-  cropped.after2 = part(frames.after2, parts[4]);
-
-  const Result inner = separateCropped(cropped, result.chroma, crop, settings);
-  crop.paste(inner.chroma, result.chroma);
-  crop.paste(inner.frameCombWeight, result.frameCombWeight);
+  CropFrames cropped;
+  cropped.before2 = view(frames.before2, 0);
+  cropped.before = view(frames.before, 1);
+  cropped.current = view(frames.current, 2);
+  cropped.after = view(frames.after, 3);
+  cropped.after2 = view(frames.after2, 4);
+  separateCropped(cropped, crop, settings, result);
   return result;
 }
 

@@ -242,28 +242,51 @@ Plane FractionalComb::separate(const Plane& frame, const FieldLayout& layout,
   // (-1, 8, 0, -8, 1) / 12, stays accurate to much higher spatial frequencies
   // than a central difference, whose fall-off would read steep edges as
   // shallower than they are.
+  // (The derivatives are made a line at a time as the tensor's box means
+  // reach them, not stored.) Rows wrap round the frame and samples repeat
+  // the line's ends.
   const Plane luma = boxMean(frame, 4, 1, layout.field1Rows);
-  auto derivative = [&](int32_t lines, int32_t samples) {
-    const Plane p1 = shift(luma, lines, samples);
-    const Plane m1 = shift(luma, -lines, -samples);
-    const Plane p2 = shift(luma, 2 * lines, 2 * samples);
-    const Plane m2 = shift(luma, -2 * lines, -2 * samples);
-    Plane out(luma.rows, luma.cols);
-    for (size_t i = 0; i < out.v.size(); i++) {
-      out.v[i] = static_cast<Sample>(
-          ((8.0 * (p1.v[i] - m1.v[i])) - (p2.v[i] - m2.v[i])) / 12.0);
+  const int32_t rows = frame.rows;
+  const int32_t cols = frame.cols;
+  auto derivative = [&](int32_t r, int32_t lines, int32_t samples, Sample* o) {
+    auto line = [&](int32_t k) {
+      return luma.row((((r + (k * lines)) % rows) + rows) % rows);
+    };
+    const Sample* p1 = line(1);
+    const Sample* m1 = line(-1);
+    const Sample* p2 = line(2);
+    const Sample* m2 = line(-2);
+    auto at = [&](const Sample* x, int32_t c) {
+      return x[std::clamp(c, 0, cols - 1)];
+    };
+    for (int32_t c = 0; c < cols; c++) {
+      o[c] = static_cast<Sample>(
+          ((8.0 * (at(p1, c + samples) - at(m1, c - samples))) -
+           (at(p2, c + (2 * samples)) - at(m2, c - (2 * samples)))) /
+          12.0);
     }
-    return out;
   };
-  const Plane gx = derivative(0, 1);
-  const Plane gy = derivative(1, 0);
-  const Plane jxx = boxMean(map(gx, [](double g) { return g * g; }),
-                            kTensorWidth, kTensorLines, layout.field1Rows);
-  const Plane jxy =
-      boxMean(map(gx, gy, [](double a, double b) { return a * b; }),
-              kTensorWidth, kTensorLines, layout.field1Rows);
-  const Plane jyy = boxMean(map(gy, [](double g) { return g * g; }),
-                            kTensorWidth, kTensorLines, layout.field1Rows);
+  std::vector<Sample> gx(static_cast<size_t>(cols));
+  std::vector<Sample> gy(static_cast<size_t>(cols));
+  auto tensor = [&](bool x, bool y) {
+    return boxMeanOf(
+        rows, cols, kTensorWidth, kTensorLines, layout.field1Rows,
+        [&](int32_t r, Sample* o) {
+          const Sample* a = gx.data();
+          const Sample* b = gy.data();
+          if (x) derivative(r, 0, 1, gx.data());
+          if (y) derivative(r, 1, 0, gy.data());
+          if (!x) a = b;
+          if (!y) b = a;
+          for (int32_t c = 0; c < cols; c++) {
+            o[c] = static_cast<Sample>(static_cast<double>(a[c]) * b[c]);
+          }
+          return static_cast<const Sample*>(o);
+        });
+  };
+  const Plane jxx = tensor(true, false);
+  const Plane jxy = tensor(true, true);
+  const Plane jyy = tensor(false, true);
 
   const auto designs = static_cast<int32_t>(table.slopes.size());
   Plane chroma(frame.rows, frame.cols);

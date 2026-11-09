@@ -392,34 +392,6 @@ inline Plane cycleMean(const Plane& x, int32_t field1Rows) {
                      [&](int32_t r, Sample*) { return x.row(r); });
 }
 
-// The rows [first1, end1) and [first2, end2) of |x| (the two fields' parts of
-// a frame) as a plane of their own: the first range's rows, then the
-// second's, and samples [0, cols) of each.
-inline Plane cropRows(const Plane& x, int32_t first1, int32_t end1,
-                      int32_t first2, int32_t end2, int32_t cols) {
-  Plane out((end1 - first1) + (end2 - first2), cols);
-  int32_t o = 0;
-  for (int32_t r = first1; r < end1; r++) {
-    std::copy(x.row(r), x.row(r) + cols, out.row(o++));
-  }
-  for (int32_t r = first2; r < end2; r++) {
-    std::copy(x.row(r), x.row(r) + cols, out.row(o++));
-  }
-  return out;
-}
-
-// The inverse: |part| written back over the same rows and samples of |x|.
-inline void pasteRows(const Plane& part, int32_t first1, int32_t end1,
-                      int32_t first2, int32_t end2, Plane& x) {
-  int32_t o = 0;
-  for (int32_t r = first1; r < end1; r++, o++) {
-    std::copy(part.row(o), part.row(o) + part.cols, x.row(r));
-  }
-  for (int32_t r = first2; r < end2; r++, o++) {
-    std::copy(part.row(o), part.row(o) + part.cols, x.row(r));
-  }
-}
-
 // The |q|th percentile of |values| (0..100), interpolating linearly between
 // the two nearest ranks; values is reordered. 0 for no values.
 inline double percentile(std::vector<double>& values, double q) {
