@@ -300,7 +300,9 @@ struct CropFrames {
 };
 
 // The 3D comb over the crop, written into |result| (whole-frame planes):
-// result.chroma holds the 2D comb's chroma on entry, frameCombWeight zero.
+// result.chroma holds the 2D comb's chroma on entry, frameCombWeight zero;
+// |lineCombed| is the 2D comb's with the 3-line comb on horizontal edges (see
+// FractionalComb::separate), which shows where the 2D comb is wrong.
 // The weights come from |measured|, the frame combs from |frames|.
 //
 // The measures are reduced, as soon as all they feed is known, to the few
@@ -308,7 +310,7 @@ struct CropFrames {
 // are held at once.
 void separateCropped(const CropFrames& frames, const CropFrames& measured,
                      const Crop& crop, const Ntsc3dComb::Settings& settings,
-                     Ntsc3dComb::Result& result) {
+                     const Plane& lineCombed, Ntsc3dComb::Result& result) {
   const FieldLayout& layout = crop.layout;
   const ActivePicture& picture = crop.picture;
   const CropRows& current = *measured.current;
@@ -679,12 +681,15 @@ void separateCropped(const CropFrames& frames, const CropFrames& measured,
   // chroma, and the frame comb is needed. This is judged on the 2D comb's own
   // output, not against the frame comb, so it holds where the frame comb is
   // the wrong one: a colour that changes from frame to frame and back (A, B,
-  // A, B) passes every test between frames of the same chroma phase. Its
-  // noise is held to the sync tip's, like the floors above. (The lines above
-  // and below are the frame's, which past a field's last line wrap round to
-  // the next.) Needed and not a flash: |keep| becomes their product.
+  // A, B) passes every test between frames of the same chroma phase. It is
+  // the line-combed output: along a horizontal edge the combs the 2D comb
+  // takes can mistake luma detail for chroma without failing to invert, where
+  // the 3-line comb, averaging the chroma across the edge, fails. Its noise
+  // is held to the sync tip's, like the floors above. (The lines above and
+  // below are the frame's, which past a field's last line wrap round to the
+  // next.) Needed and not a flash: |keep| becomes their product.
   {
-    const Plane& frameLine = result.chroma;
+    const Plane& frameLine = lineCombed;
     const Plane unsure = cycleMeanOf(rows, cols, f1, [&](int32_t r, Sample* o) {
       const int32_t frameRows = frameLine.rows;
       const int32_t at = crop.frameRow(r);
@@ -860,7 +865,10 @@ Ntsc3dComb::Result Ntsc3dComb::separate(const Frames& frames,
          (frames.before2 == nullptr) == (measured.before2 == nullptr) &&
          (frames.after2 == nullptr) == (measured.after2 == nullptr));
   Result result;
-  result.chroma = FractionalComb::separate(*frames.current, layout, picture);
+  Plane lineCombed;
+  result.chroma = FractionalComb::separate(
+      *frames.current, layout, picture, &lineCombed,
+      (measured.current != frames.current) ? measured.current : nullptr);
   result.frameCombWeight = Plane(layout.rows, layout.cols, 0.0);
   if (frames.before == nullptr && frames.after == nullptr) return result;
 
@@ -887,7 +895,7 @@ Ntsc3dComb::Result Ntsc3dComb::separate(const Frames& frames,
   // chroma band is then taken once.)
   const CropFrames croppedMeasured =
       (measured.current == frames.current) ? cropped : crops(measured, 5);
-  separateCropped(cropped, croppedMeasured, crop, settings, result);
+  separateCropped(cropped, croppedMeasured, crop, settings, lineCombed, result);
   return result;
 }
 

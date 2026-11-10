@@ -85,9 +85,10 @@ class Ntsc3dComb {
                          const Settings& settings);
 
   // As above, for a channel that carries only the chroma (a Y/C source's C):
-  // |frames| are separated, while the motion is measured on |measured|, the
-  // whole signal (Y + C) of the same frames, present where |frames| are. On
-  // the chroma alone a scene cut or moving luma would read as still.
+  // |frames| are separated, while the motion, and the picture's direction
+  // for the 2D comb, are measured on |measured|, the whole signal (Y + C) of
+  // the same frames, present where |frames| are. On the chroma alone a scene
+  // cut or moving luma would read as still, and every edge as flat.
   static Result separate(const Frames& frames, const Frames& measured,
                          const FieldLayout& layout,
                          const ActivePicture& picture,

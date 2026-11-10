@@ -38,7 +38,11 @@ namespace ntsc_comb {
 // Per sample the luma's structure tensor (on the chroma-free 4-sample mean)
 // gives the slope and how one-directional the picture is. The two nearest
 // filters are interpolated; where the picture has no clear direction (texture,
-// flat) or the slope no trusted filter, the 3-line comb is used.
+// flat) or the slope no trusted filter, the 3-line comb is used. Nearer
+// horizontal, where the 3-line comb would average the different chroma of
+// the lines either side of the edge, the 2-line comb with the neighbour line
+// that matches is used, or where neither does, the 3-line comb plus the
+// near-subcarrier part of what it rejected.
 //
 // Thread safety: the filters are built once, on first use, and only read
 // afterwards; separate() may be called from any number of threads.
@@ -46,9 +50,17 @@ class FractionalComb {
  public:
   // The chroma of |frame| (the composite, flat rows), over the whole frame.
   // Rows without both same-field neighbours inside |picture| take the
-  // bandpass alone.
+  // bandpass alone. |lineCombed|, if given, receives the same with the
+  // 3-line comb on horizontal edges too: its errors there (chroma averaged
+  // across the edge) show as chroma that fails to invert from line to line,
+  // those of the combs taken there instead (luma detail along the line taken
+  // for chroma) need not. |measured|, if
+  // given, is the whole signal the picture's direction is measured on, where
+  // |frame| carries only the chroma (a Y/C source's Y + C, and its C).
   static Plane separate(const Plane& frame, const FieldLayout& layout,
-                        const ActivePicture& picture);
+                        const ActivePicture& picture,
+                        Plane* lineCombed = nullptr,
+                        const Plane* measured = nullptr);
 
   // One slope's filter: tap weights at (line offset, sample offset)
   // positions, and how far it can be trusted (0..1).

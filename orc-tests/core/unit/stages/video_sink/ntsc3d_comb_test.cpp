@@ -397,4 +397,64 @@ TEST(FractionalCombTest, SlopedLumaEdge_IsCancelledAlongItsSlope) {
   EXPECT_LT(fractional, 0.1 * threeLine);
 }
 
+TEST(FractionalCombTest, ThinStripesOfColour_TakeEachLinesOwnChroma) {
+  // Horizontal stripes two field lines high, light and coloured in turn: the
+  // 3-line comb averages each line's chroma with its neighbours' (left in the
+  // luma as dots), where along the stripes the bandpass takes the line's own.
+  const Plane light = makeFrame(0, flat(80.0), 0.0, 0.0);
+  const Plane colour = makeFrame(0, flat(20.0), kAmplitude, kTheta);
+  auto coloured = [](int32_t r) { return (frameLineOf(r) / 2) % 4 >= 2; };
+  Plane frame = light;
+  for (int32_t r = 0; r < kRows; r++) {
+    if (!coloured(r)) continue;
+    for (int32_t h = 0; h < kCols; h++) frame.set(r, h, colour.at(r, h));
+  }
+  const Plane chroma = FractionalComb::separate(frame, layout(), picture());
+  const Plane bp = ntsc_comb::bandpass(frame);
+
+  double fractional = 0.0, threeLine = 0.0;
+  forInterior([&](int32_t r, int32_t h) {
+    const double truth =
+        coloured(r) ? trueChroma(0, r, h, kAmplitude, kTheta) : 0.0;
+    const double base =
+        (0.5 * bp.at(r, h)) - (0.25 * (bp.at(r - 1, h) + bp.at(r + 1, h)));
+    fractional += (chroma.at(r, h) - truth) * (chroma.at(r, h) - truth);
+    threeLine += (base - truth) * (base - truth);
+  });
+  EXPECT_LT(fractional, 0.1 * threeLine);
+}
+
+TEST(FractionalCombTest,
+     ThinStripesWithDetailAlongThem_KeepTheDetailInTheLuma) {
+  // As above, the light stripes carrying fine luma detail along them, the
+  // same on each of their lines (lettering on a trim strip): the bandpass
+  // would take it for chroma, the comb with the matching line leaves it.
+  const LumaFn lettered = [](int32_t, int32_t, int32_t h) {
+    return 80.0 + (10.0 * hashUniform(5, 0, h));
+  };
+  const Plane light = makeFrame(0, lettered, 0.0, 0.0);
+  const Plane colour = makeFrame(0, flat(20.0), kAmplitude, kTheta);
+  auto coloured = [](int32_t r) { return (frameLineOf(r) / 2) % 4 >= 2; };
+  Plane frame = light;
+  for (int32_t r = 0; r < kRows; r++) {
+    if (!coloured(r)) continue;
+    for (int32_t h = 0; h < kCols; h++) frame.set(r, h, colour.at(r, h));
+  }
+  const Plane chroma = FractionalComb::separate(frame, layout(), picture());
+  const Plane bp = ntsc_comb::bandpass(frame);
+
+  double fractional = 0.0, threeLine = 0.0, bandpass = 0.0;
+  forInterior([&](int32_t r, int32_t h) {
+    const double truth =
+        coloured(r) ? trueChroma(0, r, h, kAmplitude, kTheta) : 0.0;
+    const double base =
+        (0.5 * bp.at(r, h)) - (0.25 * (bp.at(r - 1, h) + bp.at(r + 1, h)));
+    fractional += (chroma.at(r, h) - truth) * (chroma.at(r, h) - truth);
+    threeLine += (base - truth) * (base - truth);
+    bandpass += (bp.at(r, h) - truth) * (bp.at(r, h) - truth);
+  });
+  EXPECT_LT(fractional, 0.25 * threeLine);
+  EXPECT_LT(fractional, 0.25 * bandpass);
+}
+
 }  // namespace orc_unit_test

@@ -13,6 +13,7 @@
 #include <orc/stage/cvbs_signal_constants.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <complex>
 #include <map>
@@ -56,9 +57,47 @@ constexpr double kCoherenceLow = 0.7;
 constexpr double kCoherenceHigh = 0.9;
 // Gradient energy (codes squared) counted as flat.
 constexpr double kFlatEnergy = 4.0;
+// Slopes (samples per field line) from which a clear direction counts as
+// horizontal, fully at the second. Along a horizontal edge the 3-line comb
+// averages in the lines either side of it: at a colour edge, their chroma,
+// left in the luma as dots (thin stripes of colour). There instead:
+// - Where one neighbour line matches the current one better than the other
+//   (a stripe two lines high or more, either side of an edge), the 2-line comb
+//   with it, which takes the line's own chroma and leaves the luma detail
+//   along it (lettering on a trim strip) in the luma.
+// - Where neither does (a stripe one line high), the 3-line comb plus the
+//   part of the band it rejected that lies near the subcarrier: chroma along
+//   the edge is steady, luma detail along it mostly off the subcarrier.
+constexpr double kHorizontalSlopes[] = {3.0, 6.0};
+// A neighbour line matches where its low-frequency luma differs from the
+// current line's by up to the first fraction of the other's difference
+// (fully), not at all from the second; summed over kMatchReach samples either
+// side.
+constexpr double kMatchRatios[] = {0.3, 0.7};
+constexpr int32_t kMatchReach = 2;
+// The near-subcarrier filter: kNarrowReach samples either side, Hann-windowed,
+// passing about +-0.6 MHz of the subcarrier.
+constexpr int32_t kNarrowReach = 16;
 
 double trust(double value, const double (&limits)[2]) {
   return std::clamp((limits[1] - value) / (limits[1] - limits[0]), 0.0, 1.0);
+}
+
+// The near-subcarrier filter's taps, unit gain at the subcarrier.
+const std::array<double, (2 * kNarrowReach) + 1>& narrowTaps() {
+  static const auto taps = [] {
+    std::array<double, (2 * kNarrowReach) + 1> t{};
+    double gain = 0.0;
+    for (int32_t k = -kNarrowReach; k <= kNarrowReach; k++) {
+      const double window =
+          0.5 + (0.5 * std::cos(kPi * k / (kNarrowReach + 1)));
+      t[k + kNarrowReach] = window * std::cos(kPi * k / 2.0);
+      if (k % 2 == 0) gain += window;
+    }
+    for (double& x : t) x /= gain;
+    return t;
+  }();
+  return taps;
 }
 
 double linspace(double a, double b, int32_t steps, int32_t i) {
@@ -235,7 +274,8 @@ FractionalComb::Design FractionalComb::design(double d) {
 }
 
 Plane FractionalComb::separate(const Plane& frame, const FieldLayout& layout,
-                               const ActivePicture& picture) {
+                               const ActivePicture& picture, Plane* lineCombed,
+                               const Plane* measured) {
   const DesignTable& table = designTable();
   const Plane bp = bandpass(frame);
 
@@ -246,7 +286,8 @@ Plane FractionalComb::separate(const Plane& frame, const FieldLayout& layout,
   // (The derivatives are made a line at a time as the tensor's box means
   // reach them, not stored.) As in the box means, fields are never mixed:
   // lines repeat the field's first and last, and samples the line's ends.
-  const Plane luma = boxMean(frame, 4, 1, layout.field1Rows);
+  const Plane luma = boxMean((measured != nullptr) ? *measured : frame, 4, 1,
+                             layout.field1Rows);
   const int32_t rows = frame.rows;
   const int32_t cols = frame.cols;
   auto derivative = [&](int32_t r, int32_t lines, int32_t samples, Sample* o) {
@@ -294,6 +335,7 @@ Plane FractionalComb::separate(const Plane& frame, const FieldLayout& layout,
 
   const auto designs = static_cast<int32_t>(table.slopes.size());
   Plane chroma(frame.rows, frame.cols);
+  if (lineCombed != nullptr) *lineCombed = Plane(frame.rows, frame.cols);
   for (int32_t r = 0; r < frame.rows; r++) {
     const int32_t above = (r - 1 + frame.rows) % frame.rows;
     const int32_t below = (r + 1) % frame.rows;
@@ -304,6 +346,7 @@ Plane FractionalComb::separate(const Plane& frame, const FieldLayout& layout,
     for (int32_t c = 0; c < frame.cols; c++) {
       if (!usable) {
         chroma.set(r, c, bp.at(r, c));
+        if (lineCombed != nullptr) lineCombed->set(r, c, bp.at(r, c));
         continue;
       }
       const double xx = jxx.at(r, c), xy = jxy.at(r, c), yy = jyy.at(r, c);
@@ -327,13 +370,18 @@ Plane FractionalComb::separate(const Plane& frame, const FieldLayout& layout,
       const double frac = std::clamp(position - lower, 0.0, 1.0);
       const double quality = ((1.0 - frac) * table.quality[lower]) +
                              (frac * table.quality[lower + 1]);
-      double gate = std::clamp((coherence - kCoherenceLow) /
-                                   (kCoherenceHigh - kCoherenceLow),
-                               0.0, 1.0) *
-                    quality;
+      const double coherent = std::clamp(
+          (coherence - kCoherenceLow) / (kCoherenceHigh - kCoherenceLow), 0.0,
+          1.0);
+      double gate = coherent * quality;
       if (std::fabs(slope) > kMaxSlope) gate = 0.0;
+      const double horizontal =
+          coherent *
+          std::clamp((std::fabs(slope) - kHorizontalSlopes[0]) /
+                         (kHorizontalSlopes[1] - kHorizontalSlopes[0]),
+                     0.0, 1.0);
 
-      const double base =
+      const double threeLine =
           (0.5 * bp.at(r, c)) - (0.25 * (bp.at(above, c) + bp.at(below, c)));
       double directional = 0.0;
       if (gate > 0.0) {
@@ -348,7 +396,46 @@ Plane FractionalComb::separate(const Plane& frame, const FieldLayout& layout,
           directional += weight * bp.at(row, col);
         }
       }
-      chroma.set(r, c, (gate * directional) + ((1.0 - gate) * base));
+      double alongEdge = threeLine;
+      if (horizontal > 0.0) {
+        double up = 0.0, down = 0.0;
+        for (int32_t k = -kMatchReach; k <= kMatchReach; k++) {
+          const int32_t col = std::clamp(c + k, 0, frame.cols - 1);
+          up += std::fabs(luma.at(r, col) - luma.at(above, col));
+          down += std::fabs(luma.at(r, col) - luma.at(below, col));
+        }
+        // The 2-line comb, weighted towards the nearer neighbour: the 3-line
+        // comb where both are as near.
+        const double towardsAbove =
+            ((down * down) + 1.0) / ((up * up) + (down * down) + 2.0);
+        const double pair =
+            0.5 * (bp.at(r, c) - (towardsAbove * bp.at(above, c)) -
+                   ((1.0 - towardsAbove) * bp.at(below, c)));
+        const double ratio = std::min(up, down) / (std::max(up, down) + 1.0);
+        const double match = std::clamp(
+            (kMatchRatios[1] - ratio) / (kMatchRatios[1] - kMatchRatios[0]),
+            0.0, 1.0);
+        double nearCarrier = 0.0;
+        if (match < 1.0) {
+          const auto& taps = narrowTaps();
+          for (int32_t k = -kNarrowReach; k <= kNarrowReach; k += 2) {
+            const int32_t col = std::clamp(c + k, 0, frame.cols - 1);
+            const double rejected =
+                (0.5 * bp.at(r, col)) +
+                (0.25 * (bp.at(above, col) + bp.at(below, col)));
+            nearCarrier += taps[k + kNarrowReach] * rejected;
+          }
+        }
+        alongEdge =
+            (match * pair) + ((1.0 - match) * (threeLine + nearCarrier));
+      }
+      const double sloped = gate * directional;
+      chroma.set(r, c,
+                 sloped + ((1.0 - gate) * (((1.0 - horizontal) * threeLine) +
+                                           (horizontal * alongEdge))));
+      if (lineCombed != nullptr) {
+        lineCombed->set(r, c, sloped + ((1.0 - gate) * threeLine));
+      }
     }
   }
   return chroma;
