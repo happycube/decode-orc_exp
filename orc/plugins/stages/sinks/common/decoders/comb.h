@@ -14,9 +14,12 @@
 
 #include <orc/stage/orc_source_parameters.h>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <memory>
 
 #include "comb_plane.h"
 #include "componentframe.h"
@@ -62,10 +65,13 @@ class Comb {
   void updateConfiguration(const ::orc::SourceParameters& videoParameters,
                            const Configuration& configuration);
 
-  // Decode a sequence of fields into a sequence of interlaced frames
+  // Decode a sequence of fields into a sequence of interlaced frames.
+  // |lumaFields|, when given, are the luma of a Y/C source whose chroma is
+  // |inputFields|: the adaptive 3D comb measures motion on their sum.
   void decodeFrames(const std::vector<SourceField>& inputFields,
                     int32_t startIndex, int32_t endIndex,
-                    std::vector<ComponentFrame>& componentFrames);
+                    std::vector<ComponentFrame>& componentFrames,
+                    const std::vector<SourceField>* lumaFields = nullptr);
 
   // Maximum frame size
   static constexpr int32_t MAX_WIDTH = 910;
@@ -80,7 +86,8 @@ class Comb {
   // Composite decode path - full comb filter for Y/C separation
   void decodeFramesComposite(const std::vector<SourceField>& inputFields,
                              int32_t startIndex, int32_t endIndex,
-                             std::vector<ComponentFrame>& componentFrames);
+                             std::vector<ComponentFrame>& componentFrames,
+                             const std::vector<SourceField>* lumaFields);
 
  private:
   // Comb-filter configuration parameters
@@ -94,8 +101,12 @@ class Comb {
     FrameBuffer(const ::orc::SourceParameters& videoParameters_,
                 const Configuration& configuration_);
 
+    // |lumaFirst|/|lumaSecond|: a Y/C source's luma, where the fields are
+    // its chroma (see decodeFrames); nullptr otherwise.
     void loadFields(const SourceField& firstField,
-                    const SourceField& secondField);
+                    const SourceField& secondField,
+                    const SourceField* lumaFirst = nullptr,
+                    const SourceField* lumaSecond = nullptr);
 
     // YC-specific loading - for sources with separate Y and C channels
     void loadFieldsYC(const SourceField& firstField,
@@ -104,8 +115,9 @@ class Comb {
     void split1D();
     void split2D();
 
-    // 3D against the previous frame alone (ntsc3dnoadapt).
-    void splitPreviousFrame(const FrameBuffer& previousFrame);
+    // 3D against the previous frame alone (ntsc3dnoadapt); nullptr where it
+    // cannot be used.
+    void splitPreviousFrame(const FrameBuffer* previousFrame);
 
     // Motion-adaptive 3D (ntsc3d) from the frames up to two either side;
     // nullptr where a frame cannot be used.
@@ -161,9 +173,12 @@ class Comb {
     bool present = false;
     bool blank = false;
 
-    // Adaptive 3D only: the composite as doubles in field-separated rows.
+    // Adaptive 3D only: the composite as doubles in field-separated rows, and
+    // for a Y/C source (where |flat| is the chroma) luma plus chroma, which
+    // the motion is measured on; empty otherwise.
     ntsc_comb::FieldLayout layout;
     ntsc_comb::Plane flat;
+    ntsc_comb::Plane measured;
 
     // Per-field phase id (1-4) of the frame's two fields, measured from the
     // burst by the colour_frame_phase observer; -1 unknown.  getLinePhase()
@@ -172,10 +187,15 @@ class Comb {
     int32_t firstFieldPhaseID;
     int32_t secondFieldPhaseID;
 
-    // 1D, 2D and 3D-filtered chroma samples
+    // 1D, 2D and 3D-filtered chroma samples. The adaptive 3D comb fills only
+    // the 3D buffer, so only that one is allocated for it.
     struct Sample {
       double pixel[MAX_HEIGHT][MAX_WIDTH];
-    } clpbuffer[3];
+      void clear() {
+        std::fill(&pixel[0][0], &pixel[0][0] + (MAX_HEIGHT * MAX_WIDTH), 0.0);
+      }
+    };
+    std::array<std::unique_ptr<Sample>, 3> clpbuffer;
 
     // The component frame for output (if there is one)
     ComponentFrame* componentFrame;

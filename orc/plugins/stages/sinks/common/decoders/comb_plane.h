@@ -79,8 +79,9 @@ namespace plane_storage {
 // fresh allocations that size are mapped, page-faulted and zero-filled each
 // time, which costs more than the arithmetic. Planes therefore hand their
 // storage back to a store for the thread on destruction and take it from
-// there again. At most kKept buffers are kept per thread.
-constexpr size_t kKept = 48;
+// there again. At most kKept buffers are kept per thread (the 3D comb has
+// about 16 planes live at its peak).
+constexpr size_t kKept = 24;
 
 inline std::vector<std::vector<Sample>>& store() {
   thread_local std::vector<std::vector<Sample>> buffers;
@@ -176,27 +177,6 @@ struct Plane {
   bool empty() const { return v.empty(); }
 };
 
-// out = f(a) sample by sample.
-template <typename F>
-Plane map(const Plane& a, F f) {
-  Plane out(a.rows, a.cols);
-  for (size_t i = 0; i < a.v.size(); i++) {
-    out.v[i] = static_cast<Sample>(f(static_cast<double>(a.v[i])));
-  }
-  return out;
-}
-
-// out = f(a, b) sample by sample.
-template <typename F>
-Plane map(const Plane& a, const Plane& b, F f) {
-  Plane out(a.rows, a.cols);
-  for (size_t i = 0; i < a.v.size(); i++) {
-    out.v[i] = static_cast<Sample>(
-        f(static_cast<double>(a.v[i]), static_cast<double>(b.v[i])));
-  }
-  return out;
-}
-
 // The 1D chroma bandpass [-1/4, 0, 1/2, 0, -1/4] along every line: unity gain
 // at the subcarrier (a quarter of the 4fsc rate), none at DC. The two samples
 // at each end of a line are left at zero.
@@ -217,22 +197,6 @@ inline Plane bandpass(const Plane& x) {
   Plane out(x.rows, x.cols);
   for (int32_t r = 0; r < x.rows; r++)
     bandpassLine(x.row(r), out.row(r), x.cols);
-  return out;
-}
-
-// x moved so out[r][c] = x[r + lines][c + samples]: rows wrap around the
-// frame, samples repeat the line's end. lines = -1 is the line above in the
-// same field (inside the field).
-inline Plane shift(const Plane& x, int32_t lines, int32_t samples) {
-  Plane out(x.rows, x.cols);
-  for (int32_t r = 0; r < x.rows; r++) {
-    const int32_t src = (((r + lines) % x.rows) + x.rows) % x.rows;
-    const Sample* in = x.row(src);
-    Sample* o = out.row(r);
-    for (int32_t c = 0; c < x.cols; c++) {
-      o[c] = in[std::clamp(c + samples, 0, x.cols - 1)];
-    }
-  }
   return out;
 }
 

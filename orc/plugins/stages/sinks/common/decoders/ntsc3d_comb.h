@@ -64,6 +64,7 @@ class Ntsc3dComb {
 
   // The frames, as composite in flat rows; nullptr where a frame does not
   // exist (the start or end of a sequence, a missing or out-of-phase frame).
+  // The current frame is required.
   struct Frames {
     const Plane* before2 = nullptr;
     const Plane* before = nullptr;
@@ -80,6 +81,15 @@ class Ntsc3dComb {
   };
 
   static Result separate(const Frames& frames, const FieldLayout& layout,
+                         const ActivePicture& picture,
+                         const Settings& settings);
+
+  // As above, for a channel that carries only the chroma (a Y/C source's C):
+  // |frames| are separated, while the motion is measured on |measured|, the
+  // whole signal (Y + C) of the same frames, present where |frames| are. On
+  // the chroma alone a scene cut or moving luma would read as still.
+  static Result separate(const Frames& frames, const Frames& measured,
+                         const FieldLayout& layout,
                          const ActivePicture& picture,
                          const Settings& settings);
 };

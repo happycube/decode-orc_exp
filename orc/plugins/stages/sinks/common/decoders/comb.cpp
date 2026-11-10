@@ -116,12 +116,14 @@ void Comb::updateConfiguration(const ::orc::SourceParameters& _videoParameters,
 
 void Comb::decodeFrames(const std::vector<SourceField>& inputFields,
                         int32_t startIndex, int32_t endIndex,
-                        std::vector<ComponentFrame>& componentFrames) {
+                        std::vector<ComponentFrame>& componentFrames,
+                        const std::vector<SourceField>* lumaFields) {
   if (!configurationSet) {
     ORC_LOG_ERROR("Comb::decodeFrames(): Decoder configuration is invalid");
     return;
   }
   assert((componentFrames.size() * 2) == (endIndex - startIndex));
+  assert(lumaFields == nullptr || lumaFields->size() == inputFields.size());
 
   // Check if we have YC sources (separate Y and C channels)
   // All fields must be the same type (YC or composite)
@@ -134,7 +136,8 @@ void Comb::decodeFrames(const std::vector<SourceField>& inputFields,
   } else {
     // COMPOSITE DECODE PATH - full comb filter for Y/C separation
     ORC_LOG_TRACE("Comb: Using composite decode path (Y+C modulated)");
-    decodeFramesComposite(inputFields, startIndex, endIndex, componentFrames);
+    decodeFramesComposite(inputFields, startIndex, endIndex, componentFrames,
+                          lumaFields);
   }
 }
 
@@ -185,7 +188,8 @@ void Comb::decodeFramesYC(const std::vector<SourceField>& inputFields,
 // Composite decode path - full comb filter for Y/C separation
 void Comb::decodeFramesComposite(const std::vector<SourceField>& inputFields,
                                  int32_t startIndex, int32_t endIndex,
-                                 std::vector<ComponentFrame>& componentFrames) {
+                                 std::vector<ComponentFrame>& componentFrames,
+                                 const std::vector<SourceField>* lumaFields) {
   assert(configurationSet);
   assert((componentFrames.size() * 2) == (endIndex - startIndex));
 
@@ -218,10 +222,16 @@ void Comb::decodeFramesComposite(const std::vector<SourceField>& inputFields,
 
     // If there's another input frame, bring it into the newest buffer
     const int32_t loadIndex = fieldIndex + (2 * reach);
-    if (loadIndex + 1 >= 0 &&
+    if (loadIndex >= 0 &&
         loadIndex + 1 < static_cast<int32_t>(inputFields.size())) {
       // Load fields into the buffer
-      newest.loadFields(inputFields[loadIndex], inputFields[loadIndex + 1]);
+      if (lumaFields != nullptr) {
+        newest.loadFields(inputFields[loadIndex], inputFields[loadIndex + 1],
+                          &(*lumaFields)[loadIndex],
+                          &(*lumaFields)[loadIndex + 1]);
+      } else {
+        newest.loadFields(inputFields[loadIndex], inputFields[loadIndex + 1]);
+      }
 
       // The adaptive 3D comb separates from the composite itself; every other
       // mode builds on the 1D and 2D results.
@@ -244,16 +254,16 @@ void Comb::decodeFramesComposite(const std::vector<SourceField>& inputFields,
     FrameBuffer& currentFrameBuffer = *window[reach];
     if (configuration.dimensions == 3) {
       // Extract chroma using 3D filter
+      auto usable = [&](int32_t offset) -> const FrameBuffer* {
+        const FrameBuffer* frame = window[reach + offset].get();
+        return frame->usableAround(currentFrameBuffer, offset) ? frame
+                                                               : nullptr;
+      };
       if (configuration.adaptive) {
-        auto usable = [&](int32_t offset) -> const FrameBuffer* {
-          const FrameBuffer* frame = window[reach + offset].get();
-          return frame->usableAround(currentFrameBuffer, offset) ? frame
-                                                                 : nullptr;
-        };
         currentFrameBuffer.splitAdaptive3D(usable(-2), usable(-1), usable(1),
                                            usable(2));
       } else {
-        currentFrameBuffer.splitPreviousFrame(*window[reach - 1]);
+        currentFrameBuffer.splitPreviousFrame(usable(-1));
       }
     }
 
@@ -298,6 +308,17 @@ Comb::FrameBuffer::FrameBuffer(const ::orc::SourceParameters& videoParameters_,
   layout.cols = videoParameters.frame_width_nominal;
   layout.field1Rows = static_cast<int32_t>(
       calculate_padded_field_height(videoParameters.system));
+
+  const bool adaptive3D =
+      configuration.dimensions == 3 && configuration.adaptive;
+  // Left uninitialised (loadFields clears what each mode reads), so the
+  // pages the adaptive 3D comb never writes, outside the active region, are
+  // never touched.
+  for (int32_t buf = 0; buf < 3; buf++) {
+    if (!adaptive3D || buf == 2) {
+      clpbuffer[buf] = std::unique_ptr<Sample>(new Sample);  // NOLINT
+    }
+  }
 }
 
 /*
@@ -336,7 +357,9 @@ inline bool Comb::FrameBuffer::getLinePhase(int32_t lineNumber) const {
 
 // Interlace two source fields into the framebuffer.
 void Comb::FrameBuffer::loadFields(const SourceField& firstField,
-                                   const SourceField& secondField) {
+                                   const SourceField& secondField,
+                                   const SourceField* lumaFirst,
+                                   const SourceField* lumaSecond) {
   // Interlace the input fields and place in the frame buffer.
   // SourceField is a non-owning view into the VFrameR buffer; we copy
   // field_width samples per line so rawbuffer retains uniform stride.
@@ -386,16 +409,29 @@ void Comb::FrameBuffer::loadFields(const SourceField& firstField,
       ntsc_comb::Sample* row = flat.row(layout.rowOf(lineNumber));
       for (int32_t h = 0; h < layout.cols; h++) row[h] = line[h];
     }
-  } else {
-    // Clear clpbuffer (the adaptive 3D comb writes all of the active region
-    // it reads back, so it skips this)
-    for (int32_t buf = 0; buf < 3; buf++) {
-      for (int32_t y = 0; y < MAX_HEIGHT; y++) {
-        for (int32_t x = 0; x < MAX_WIDTH; x++) {
-          clpbuffer[buf].pixel[y][x] = 0.0;
+
+    // A Y/C source's luma plus its chroma. (The chroma's DC offset is left
+    // in: the motion measures are all differences between frames or in the
+    // chroma band, where it cancels.)
+    measured = ntsc_comb::Plane();
+    if (lumaFirst != nullptr && lumaSecond != nullptr) {
+      measured = flat;
+      for (int32_t lineNumber = 0; lineNumber < frameHeight; lineNumber++) {
+        const bool first = (lineNumber % 2) == 0;
+        const SourceField& field = first ? *lumaFirst : *lumaSecond;
+        const auto fieldLine = static_cast<size_t>(lineNumber / 2);
+        if (fieldLine >= field.line_count) continue;
+        const int16_t* line = field.getLine(fieldLine);
+        ntsc_comb::Sample* row = measured.row(layout.rowOf(lineNumber));
+        for (int32_t h = 0; h < layout.cols; h++) {
+          row[h] += static_cast<ntsc_comb::Sample>(line[h]);
         }
       }
     }
+  } else {
+    // Clear clpbuffer (the adaptive 3D comb writes all of the active region
+    // it reads back, so it skips this)
+    for (auto& buffer : clpbuffer) buffer->clear();
   }
 
   // No component frame yet
@@ -470,12 +506,8 @@ void Comb::FrameBuffer::loadFieldsYC(const SourceField& firstField,
   secondFieldPhaseID = secondField.field_phase_id.value_or(-1);
 
   // Clear clpbuffer (not used for YC, but clear anyway for consistency)
-  for (int32_t buf = 0; buf < 3; buf++) {
-    for (int32_t y = 0; y < MAX_HEIGHT; y++) {
-      for (int32_t x = 0; x < MAX_WIDTH; x++) {
-        clpbuffer[buf].pixel[y][x] = 0.0;
-      }
-    }
+  for (auto& buffer : clpbuffer) {
+    if (buffer) buffer->clear();
   }
 
   // No component frame yet
@@ -505,7 +537,7 @@ void Comb::FrameBuffer::split1D() {
       double tc1 = (line[h] - ((line[h - 2] + line[h + 2]) / 2.0)) / 2.0;
 
       // Record the 1D C value
-      clpbuffer[0].pixel[lineNumber][h] = tc1;
+      clpbuffer[0]->pixel[lineNumber][h] = tc1;
     }
   }
 }
@@ -530,12 +562,12 @@ void Comb::FrameBuffer::split2D() {
     // If a line we need is outside the active area, use blackLine instead.
     const double* previousLine = blackLine;
     if (lineNumber - 2 >= videoParameters.first_active_frame_line) {
-      previousLine = clpbuffer[0].pixel[lineNumber - 2];
+      previousLine = clpbuffer[0]->pixel[lineNumber - 2];
     }
-    const double* currentLine = clpbuffer[0].pixel[lineNumber];
+    const double* currentLine = clpbuffer[0]->pixel[lineNumber];
     const double* nextLine = blackLine;
     if (lineNumber + 2 < videoParameters.last_active_frame_line) {
-      nextLine = clpbuffer[0].pixel[lineNumber + 2];
+      nextLine = clpbuffer[0]->pixel[lineNumber + 2];
     }
 
     for (int32_t h = videoParameters.active_video_start;
@@ -597,23 +629,26 @@ void Comb::FrameBuffer::split2D() {
       tc1 += ((currentLine[h] - nextLine[h]) * kn * sc);
       tc1 /= 4;
 
-      clpbuffer[1].pixel[lineNumber][h] = tc1;
+      clpbuffer[1]->pixel[lineNumber][h] = tc1;
     }
   }
 }
 
 // Extract chroma into clpbuffer[2] with a frame comb against the previous
 // frame: this sample is Y + C and the previous frame's is (ideally) Y - C, so
-// C = ((Y + C) - (Y - C)) / 2.
-void Comb::FrameBuffer::splitPreviousFrame(const FrameBuffer& previousFrame) {
+// C = ((Y + C) - (Y - C)) / 2. Without a usable previous frame (the start of
+// a sequence, a skip) the 2D result stands.
+void Comb::FrameBuffer::splitPreviousFrame(const FrameBuffer* previousFrame) {
   for (int32_t lineNumber = videoParameters.first_active_frame_line;
        lineNumber < videoParameters.last_active_frame_line; lineNumber++) {
     for (int32_t h = videoParameters.active_video_start;
          h < videoParameters.active_video_end; h++) {
-      clpbuffer[2].pixel[lineNumber][h] =
-          (clpbuffer[0].pixel[lineNumber][h] -
-           previousFrame.clpbuffer[0].pixel[lineNumber][h]) /
-          2;
+      clpbuffer[2]->pixel[lineNumber][h] =
+          previousFrame != nullptr
+              ? (clpbuffer[0]->pixel[lineNumber][h] -
+                 previousFrame->clpbuffer[0]->pixel[lineNumber][h]) /
+                    2
+              : clpbuffer[1]->pixel[lineNumber][h];
     }
   }
 }
@@ -624,12 +659,19 @@ void Comb::FrameBuffer::splitAdaptive3D(const FrameBuffer* before2,
                                         const FrameBuffer* before,
                                         const FrameBuffer* after,
                                         const FrameBuffer* after2) {
-  ntsc_comb::Ntsc3dComb::Frames frames;
-  frames.current = &flat;
-  frames.before2 = before2 != nullptr ? &before2->flat : nullptr;
-  frames.before = before != nullptr ? &before->flat : nullptr;
-  frames.after = after != nullptr ? &after->flat : nullptr;
-  frames.after2 = after2 != nullptr ? &after2->flat : nullptr;
+  auto framesOf = [&](ntsc_comb::Plane FrameBuffer::* plane) {
+    auto of = [&](const FrameBuffer* frame) {
+      return frame != nullptr ? &(frame->*plane) : nullptr;
+    };
+    ntsc_comb::Ntsc3dComb::Frames frames;
+    frames.current = &(this->*plane);
+    frames.before2 = of(before2);
+    frames.before = of(before);
+    frames.after = of(after);
+    frames.after2 = of(after2);
+    return frames;
+  };
+  const auto frames = framesOf(&FrameBuffer::flat);
 
   const auto picture = ntsc_comb::ActivePicture::fromFrameLines(
       layout, videoParameters.first_active_frame_line,
@@ -639,14 +681,20 @@ void Comb::FrameBuffer::splitAdaptive3D(const FrameBuffer* before2,
   settings.motionThreshold = configuration.motionThreshold;
   settings.detailThreshold = configuration.detailThreshold;
 
+  // A Y/C source's chroma, its motion measured with the luma (every frame
+  // of the sequence is loaded the same way)
   const auto result =
-      ntsc_comb::Ntsc3dComb::separate(frames, layout, picture, settings);
+      measured.v.empty()
+          ? ntsc_comb::Ntsc3dComb::separate(frames, layout, picture, settings)
+          : ntsc_comb::Ntsc3dComb::separate(frames,
+                                            framesOf(&FrameBuffer::measured),
+                                            layout, picture, settings);
   for (int32_t lineNumber = videoParameters.first_active_frame_line;
        lineNumber < videoParameters.last_active_frame_line; lineNumber++) {
     const ntsc_comb::Sample* row = result.chroma.row(layout.rowOf(lineNumber));
     for (int32_t h = videoParameters.active_video_start;
          h < videoParameters.active_video_end; h++) {
-      clpbuffer[2].pixel[lineNumber][h] = row[h];
+      clpbuffer[2]->pixel[lineNumber][h] = row[h];
     }
   }
 }
@@ -841,7 +889,7 @@ void Comb::FrameBuffer::splitIQlocked() {
       // Bounds check for both dimensions
       if (h < videoParameters.frame_width_nominal) {
         const auto val =
-            clpbuffer[configuration.dimensions - 1].pixel[lineNumber][h];
+            clpbuffer[configuration.dimensions - 1]->pixel[lineNumber][h];
         chromaLine[h] = val;  // Store as double to preserve precision
         // Subtract the split chroma part from the luma signal
         Y[h - xOffset] = line[h] - val;
@@ -895,7 +943,8 @@ void Comb::FrameBuffer::splitIQ() {
       if (h < videoParameters.frame_width_nominal) {
         chromaLine[h] =
             clpbuffer[configuration.dimensions - 1]
-                .pixel[lineNumber][h];  // Store as double to preserve precision
+                ->pixel[lineNumber]
+                       [h];  // Store as double to preserve precision
       }
     }
 

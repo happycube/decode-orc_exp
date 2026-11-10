@@ -248,10 +248,11 @@ class VideoSinkStage : public DAGStage,
   // one per frame; a seek then costs three to four single decodes rather
   // than five. Measured in a Release build on the development machine with
   // noise reduction on, a seek took 0.08 s (ntsc2d), 0.10 s (pal2d),
-  // 0.14 s (transform2d), 0.24 s (ntsc3d) and 0.35 s (transform3d); the
-  // spatial filter added later costs at most 10 ms more per frame, so every
-  // decoder stays well inside the plan's one-second budget and the same
-  // value serves them all.
+  // 0.14 s (transform2d) and 0.35 s (transform3d); the spatial filter added
+  // later costs at most 10 ms more per frame. The motion-adaptive ntsc3d,
+  // measured on a machine where the ntsc2d seek took 0.16 s, took 0.74 s
+  // (0.17 s a step in playback). Every decoder stays inside the plan's
+  // one-second budget and the same value serves them all.
   static constexpr int32_t kPreviewWarmupFrames = 4;
   mutable PreviewNoiseFilter preview_noise_filter_;
   // Serialises preview decodes: the decoder cache and the filter state are

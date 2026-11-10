@@ -232,7 +232,7 @@ TEST_F(VideoSinkDecoderScheduleTest, Batch_DecodesEachFrameWithItsDecoder) {
 }
 
 TEST_F(VideoSinkDecoderScheduleTest, Batch_GivesEachDecoderItsOwnLookAround) {
-  // ntsc3d reads a frame either side; ntsc2d reads none. The 3D frames must
+  // ntsc3d reads two frames either side; ntsc2d reads none. The 3D frames must
   // come out as they do in an all-3D export, the 2D ones as in an all-2D one.
   const auto three_d = run_export(false, "ntsc3d");
   const auto two_d = run_export(false, "ntsc2d");

@@ -10,7 +10,10 @@
 
 #include "ntsc3d_comb.h"
 
+#include <orc/stage/cvbs_signal_constants.h>
+
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <optional>
 #include <vector>
@@ -20,7 +23,7 @@
 namespace ntsc_comb {
 namespace {
 
-// Where both neighbours are still, allow this much of the chroma expected to
+// Where the picture is shown still, allow this much of the chroma expected to
 // leak through the 4-sample mean at colour edges.
 constexpr double kLeakK = 1.0;
 // Steady motion: the frame differs from the mean of its neighbours by up to
@@ -62,11 +65,12 @@ constexpr double kPictureNoiseMax = 2.0;
 // 4fsc) from the line's start; these samples sit inside its tip.
 constexpr int32_t kSyncTipStart = 10;
 constexpr int32_t kSyncTipEnd = 55;
-// SMPTE 170M-2004 Section 6.4: the colour burst; its middle, clear of the
-// envelope's rise and fall, carries constant chroma that motion cannot
-// touch, against which the chroma band's noise slope is measured.
-constexpr int32_t kBurstStart = 80;
-constexpr int32_t kBurstEnd = 104;
+// SMPTE 170M-2004 Section 6.4: the colour burst; its middle six cycles,
+// clear of the envelope's rise (two cycles) and fall (one), carry constant
+// chroma that motion cannot touch, against which the chroma band's noise
+// slope is measured.
+constexpr int32_t kBurstStart = orc::kNtscColourBurstStart + 8;
+constexpr int32_t kBurstEnd = orc::kNtscColourBurstEnd - 4;
 // Chroma-band amplitude (codes) the picture's noise slope is measured over.
 constexpr double kChromaStrong = 40.0;
 // The picture's slope needs at least this many strong samples.
@@ -177,12 +181,13 @@ class Regions {
   bool hasBurst_ = false;
 };
 
-// The floor for a change measure, from its planes for each frame pair: the
-// quietest pair's percentile over the picture, held to kPictureNoiseMin..
-// kPictureNoiseMax times the disc's (the same measure and percentile on the
-// sync tip, averaged over the pairs).
+// The floor for a change measure, from its planes for each frame pair (at
+// least one): the quietest pair's percentile over the picture, held to
+// kPictureNoiseMin..kPictureNoiseMax times the disc's (the same measure and
+// percentile on the sync tip, averaged over the pairs).
 double noiseFloor(const std::vector<const Plane*>& changes,
                   const Regions& regions) {
+  assert(!changes.empty());
   double pictureNoise = 0.0;
   bool first = true;
   for (const Plane* c : changes) {
@@ -296,20 +301,21 @@ struct CropFrames {
 
 // The 3D comb over the crop, written into |result| (whole-frame planes):
 // result.chroma holds the 2D comb's chroma on entry, frameCombWeight zero.
+// The weights come from |measured|, the frame combs from |frames|.
 //
 // The measures are reduced, as soon as all they feed is known, to the few
 // factors the final blend needs, and dropped: only some 16 planes of the crop
 // are held at once.
-void separateCropped(const CropFrames& frames, const Crop& crop,
-                     const Ntsc3dComb::Settings& settings,
+void separateCropped(const CropFrames& frames, const CropFrames& measured,
+                     const Crop& crop, const Ntsc3dComb::Settings& settings,
                      Ntsc3dComb::Result& result) {
   const FieldLayout& layout = crop.layout;
   const ActivePicture& picture = crop.picture;
-  const CropRows& current = *frames.current;
-  const CropRows* before = frames.before;
-  const CropRows* after = frames.after;
-  const CropRows* before2 = frames.before2;
-  const CropRows* after2 = frames.after2;
+  const CropRows& current = *measured.current;
+  const CropRows* before = measured.before;
+  const CropRows* after = measured.after;
+  const CropRows* before2 = measured.before2;
+  const CropRows* after2 = measured.after2;
   const int32_t rows = layout.rows;
   const int32_t cols = layout.cols;
   const int32_t f1 = layout.field1Rows;
@@ -398,18 +404,29 @@ void separateCropped(const CropFrames& frames, const Crop& crop,
     return out;
   };
 
-  // The current frame's chroma band, and a frame comb against another frame.
-  Plane now(rows, cols);
-  for (int32_t r = 0; r < rows; r++) {
-    bandpassLine(current.row(r), now.row(r), cols);
+  // The current frame's chroma band, measured and separated (the same
+  // unless only the chroma is separated), and a frame comb against another
+  // frame of those separated.
+  auto bandOf = [&](const CropRows& frame) {
+    Plane out(rows, cols);
+    for (int32_t r = 0; r < rows; r++) {
+      bandpassLine(frame.row(r), out.row(r), cols);
+    }
+    return out;
+  };
+  Plane now = bandOf(current);
+  Plane separatedNow;
+  if (frames.current != measured.current) {
+    separatedNow = bandOf(*frames.current);
   }
   const size_t n = now.v.size();
   auto frameComb = [&](const CropRows& other) {
+    const Plane& combed = separatedNow.v.empty() ? now : separatedNow;
     Plane out(rows, cols);
     std::vector<Sample> band(static_cast<size_t>(cols));
     for (int32_t r = 0; r < rows; r++) {
       bandpassLine(other.row(r), band.data(), cols);
-      const Sample* x = now.row(r);
+      const Sample* x = combed.row(r);
       Sample* o = out.row(r);
       for (int32_t c = 0; c < cols; c++) {
         o[c] = static_cast<Sample>((static_cast<double>(x[c]) - band[c]) / 2.0);
@@ -447,32 +464,12 @@ void separateCropped(const CropFrames& frames, const Crop& crop,
     return baseFloor + (amplitude.v[i] * lumaSlope);
   };
 
-  if (before == nullptr || after == nullptr) {
-    // The first or last frame of a sequence: the one neighbour's frame comb
-    // where the picture is still against it.
-    const Plane estimate = frameComb((before != nullptr) ? *before : *after);
-    const Plane& change = (before != nullptr) ? *lumaBefore : *lumaAfter;
-    for (int32_t r = 0; r < rows; r++) {
-      Sample* chroma = chromaRow(r);
-      Sample* weight = weightRow(r);
-      for (int32_t c = 0; c < cols; c++) {
-        const size_t i = regions.index(r, c);
-        const double s = stillWeight(change.v[i], lumaK * floorAt(i));
-        chroma[c] =
-            static_cast<Sample>((s * estimate.v[i]) + ((1.0 - s) * chroma[c]));
-        weight[c] = static_cast<Sample>(s);
-      }
-    }
-    return;
-  }
-
   // Colour edges: a still neighbour's chroma is the current frame's,
   // inverted, so comparing the two leaves twice the chroma, and the 4-sample
   // mean only nulls it at the subcarrier itself; a sharp colour edge's
-  // sidebands get through and read as luma change. Where the previous and
-  // next frames match, and the current frame matches one two away (so it is
-  // not a flash), the picture is still and the thresholds allow for the leak
-  // the current frame's own chroma (3-line comb estimate) would cause.
+  // sidebands get through and read as luma change. Where the picture is
+  // otherwise shown still (below), the thresholds allow for the leak the
+  // current frame's own chroma (3-line comb estimate) would cause.
   std::vector<Sample> doubled(static_cast<size_t>(cols));
   Plane allowance = boxMeanOf(rows, cols, 5, 3, f1, [&](int32_t r, Sample* o) {
     const bool comb = r >= 1 && r < rows - 1 && picture.containsRow(r) &&
@@ -492,6 +489,38 @@ void separateCropped(const CropFrames& frames, const Crop& crop,
     for (int32_t c = 0; c < cols; c++) o[c] = std::fabs(o[c]);
     return static_cast<const Sample*>(o);
   });
+
+  if (before == nullptr || after == nullptr) {
+    // The first or last frame of a sequence: the one neighbour's frame comb
+    // where the picture is still against it. Where the current frame also
+    // matches the frame two away on that side (the same chroma phase), the
+    // picture is still across the three and the colour-edge leak is allowed
+    // for.
+    const Plane estimate =
+        frameComb((before != nullptr) ? *frames.before : *frames.after);
+    const Plane& change = (before != nullptr) ? *lumaBefore : *lumaAfter;
+    const Plane* two = (before != nullptr) ? lumaB2 : lumaA2;
+    for (int32_t r = 0; r < rows; r++) {
+      Sample* chroma = chromaRow(r);
+      Sample* weight = weightRow(r);
+      for (int32_t c = 0; c < cols; c++) {
+        const size_t i = regions.index(r, c);
+        const double leak =
+            (two != nullptr)
+                ? kLeakK * stillWeight(two->v[i], lumaK * floorAt(i)) *
+                      allowance.v[i]
+                : 0.0;
+        const double s = stillWeight(change.v[i], (lumaK * floorAt(i)) + leak);
+        chroma[c] =
+            static_cast<Sample>((s * estimate.v[i]) + ((1.0 - s) * chroma[c]));
+        weight[c] = static_cast<Sample>(s);
+      }
+    }
+    return;
+  }
+
+  // Both neighbours: still where the previous and next frames match, and
+  // the current frame matches one two away (so it is not a flash).
   for (size_t i = 0; i < n; i++) {
     const double same = stillWeight(lumaBA->v[i], lumaK * floorAt(i));
     double twos = 0.0;
@@ -738,9 +767,10 @@ void separateCropped(const CropFrames& frames, const Crop& crop,
   // Each neighbour's frame comb. Where both are averaged, the two should
   // agree to within noise and an allowance for slow steady motion, which
   // their average cancels.
-  const Plane fromBefore = frameComb(*before);
-  const Plane fromAfter = frameComb(*after);
+  const Plane fromBefore = frameComb(*frames.before);
+  const Plane fromAfter = frameComb(*frames.after);
   now = Plane();
+  separatedNow = Plane();
   const Plane disagreement =
       cycleMeanOf(rows, cols, f1, [&](int32_t r, Sample* o) {
         const Sample* b = fromBefore.row(r);
@@ -800,12 +830,12 @@ void separateCropped(const CropFrames& frames, const Crop& crop,
       const double weightBoth = smoothBoth[c];
       const double weightBefore = smoothBefore[c];
       const double weightAfter = smoothAfter[c];
-      const double frameComb = weightBoth + weightBefore + weightAfter;
+      const double combed = weightBoth + weightBefore + weightAfter;
       chroma[c] = static_cast<Sample>(
           (weightBoth * (static_cast<double>(fromB[c]) + fromA[c]) / 2.0) +
           (weightBefore * fromB[c]) + (weightAfter * fromA[c]) +
-          ((1.0 - frameComb) * chroma[c]));
-      weight[c] = static_cast<Sample>(frameComb);
+          ((1.0 - combed) * chroma[c]));
+      weight[c] = static_cast<Sample>(combed);
     }
   }
 }
@@ -816,6 +846,19 @@ Ntsc3dComb::Result Ntsc3dComb::separate(const Frames& frames,
                                         const FieldLayout& layout,
                                         const ActivePicture& picture,
                                         const Settings& settings) {
+  return separate(frames, frames, layout, picture, settings);
+}
+
+Ntsc3dComb::Result Ntsc3dComb::separate(const Frames& frames,
+                                        const Frames& measured,
+                                        const FieldLayout& layout,
+                                        const ActivePicture& picture,
+                                        const Settings& settings) {
+  assert(frames.current != nullptr && measured.current != nullptr);
+  assert((frames.before == nullptr) == (measured.before == nullptr) &&
+         (frames.after == nullptr) == (measured.after == nullptr) &&
+         (frames.before2 == nullptr) == (measured.before2 == nullptr) &&
+         (frames.after2 == nullptr) == (measured.after2 == nullptr));
   Result result;
   result.chroma = FractionalComb::separate(*frames.current, layout, picture);
   result.frameCombWeight = Plane(layout.rows, layout.cols, 0.0);
@@ -824,19 +867,27 @@ Ntsc3dComb::Result Ntsc3dComb::separate(const Frames& frames,
   // The 3D comb works on the picture and a margin round it (see Crop); the
   // 2D comb stands elsewhere.
   const Crop crop(layout, picture);
-  std::optional<CropRows> rows[5];
+  std::optional<CropRows> rows[10];
   auto view = [&](const Plane* frame, int32_t k) -> const CropRows* {
     if (frame == nullptr) return nullptr;
     rows[k].emplace(*frame, crop);
     return &*rows[k];
   };
-  CropFrames cropped;
-  cropped.before2 = view(frames.before2, 0);
-  cropped.before = view(frames.before, 1);
-  cropped.current = view(frames.current, 2);
-  cropped.after = view(frames.after, 3);
-  cropped.after2 = view(frames.after2, 4);
-  separateCropped(cropped, crop, settings, result);
+  auto crops = [&](const Frames& f, int32_t k) {
+    CropFrames cropped;
+    cropped.before2 = view(f.before2, k);
+    cropped.before = view(f.before, k + 1);
+    cropped.current = view(f.current, k + 2);
+    cropped.after = view(f.after, k + 3);
+    cropped.after2 = view(f.after2, k + 4);
+    return cropped;
+  };
+  const CropFrames cropped = crops(frames, 0);
+  // (Views of the same frames where they are the same: the current frame's
+  // chroma band is then taken once.)
+  const CropFrames croppedMeasured =
+      (measured.current == frames.current) ? cropped : crops(measured, 5);
+  separateCropped(cropped, croppedMeasured, crop, settings, result);
   return result;
 }
 

@@ -37,10 +37,11 @@ done that separation:
   setting itself is switched to `pal2d`), and decodes any Transform ranges of a
   `multiple` schedule with `pal2d` too. The parameter description in the
   stage's parameter dialog says so when the input is Y/C.
-- The NTSC decoder's Y/C path skips the 1D, 2D, and 3D comb stages and
-  demodulates the supplied chroma channel directly. Choosing `ntsc1d`,
-  `ntsc2d`, `ntsc3d`, or `ntsc3dnoadapt` therefore does not select a different
-  comb filter for Y/C input.
+- The NTSC decoder's Y/C path uses the luma channel as supplied and runs the
+  selected comb on the chroma channel alone, where it removes noise (and any
+  luma left in the chroma) rather than separating luma from chroma. `ntsc3d`
+  measures the motion on the luma and chroma together, so it sees a scene cut
+  or moving picture as it would on composite input.
 
 For Y/C, use the normal `pal2d` or `ntsc2d` setting and concentrate on burst
 quality, `chroma_gain`, `chroma_phase`, and noise reduction instead.
@@ -265,7 +266,7 @@ trails, or to halve the SECAM decoding time.
 | `ntsc1d` | Uses a line-local band-pass separation. It cannot distinguish luma detail at the subcarrier frequency from chroma very well. | Diagnostic renders, rapid comparisons, or a fallback when no spatial/temporal comparison is wanted. | Usually the weakest colour quality: dot crawl and cross-colour/luma leakage are expected. |
 | `ntsc2d` | Uses an adaptive three-line comb within the field, comparing the neighbouring lines before blending them. | The general starting point and the current NTSC default. It gives a substantial improvement over 1D without temporal processing. | Cannot use matching information from adjacent fields or frames. |
 | `ntsc3d` | Motion adaptive: a frame comb against the neighbouring frames where the picture is still and a 2D comb would mistake luma detail for chroma; elsewhere a 2D line comb that follows each edge's own slope. | Static or slowly changing content, animation, and quality-focused renders where the additional compute cost is acceptable. | Reads two frames either side and is slower. Motion, flashes and scene cuts fall back to the 2D comb, but moving material should still be checked for artefacts. |
-| `ntsc3dnoadapt` | Performs 3D separation against the previous frame without the adaptive candidate selection. | Controlled comparisons, debugging, or unusually stable content where you intentionally want the fixed previous-frame behaviour. | Motion or a bad previous frame can turn luma differences into colour artefacts. It is not the normal quality choice. |
+| `ntsc3dnoadapt` | Performs 3D separation against the previous frame alone, with none of `ntsc3d`'s motion detection. Where there is no usable previous frame (the start of a sequence, a skipped or repeated field) it keeps the 2D result. | Controlled comparisons, debugging, or unusually stable content where you intentionally want the fixed previous-frame behaviour. | Motion or a bad previous frame can turn luma differences into colour artefacts. It is not the normal quality choice. |
 
 The 3D mode does not blindly average whole frames. For each sample it decides
 how still the picture is against each neighbouring frame, measured against the
@@ -294,6 +295,11 @@ fail before the frame comb is used. Lower values frame-comb more widely, which
 removes more cross-colour from fine still detail but keeps more of the
 capture's noise as a fine dot pattern in flat areas; `0` frame-combs wherever
 the picture is still. Raise it if flat still areas look grainy.
+
+These replace the earlier `ntsc3d`'s `chroma_weight` and `adapt_threshold`,
+which no longer exist. A project that set them still loads, but their values
+are ignored: they tuned a different method, so there is nothing to carry them
+over to. Check the `ntsc3d` output of such projects with the new defaults.
 
 ## Shared controls
 

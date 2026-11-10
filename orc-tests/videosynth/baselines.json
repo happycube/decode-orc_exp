@@ -1165,25 +1165,25 @@
       "ramps_y_rms_pct": {"value": 0.445329385977077, "tolerance": 0.02240239104894518, "better": "lower"}
     },
     "DecoderTruth.NTSC_ntsc3d": {
-      "bars_u_rms_pct": {"value": 0.11852464059859387, "tolerance": 0.01, "better": "lower"},
-      "bars_v_rms_pct": {"value": 0.08009068895127668, "tolerance": 0.01, "better": "lower"},
-      "bars_y_rms_pct": {"value": 0.2768817581146137, "tolerance": 0.013914659566507863, "better": "lower"},
-      "multiburst_u_rms_pct": {"value": 0.07169229594520124, "tolerance": 0.01, "better": "lower"},
-      "multiburst_v_rms_pct": {"value": 0.05078511494285544, "tolerance": 0.01, "better": "lower"},
-      "multiburst_y_rms_pct": {"value": 0.07684022571431205, "tolerance": 0.01, "better": "lower"},
-      "ramps_u_rms_pct": {"value": 0.19598974869342098, "tolerance": 0.01008337774495143, "better": "lower"},
-      "ramps_v_rms_pct": {"value": 0.12056567121282293, "tolerance": 0.01, "better": "lower"},
-      "ramps_y_rms_pct": {"value": 0.5617433146600606, "tolerance": 0.02820976001643749, "better": "lower"}
+      "bars_u_rms_pct": {"value": 0.06889371152350211, "tolerance": 0.01, "better": "lower"},
+      "bars_v_rms_pct": {"value": 0.06074535965947033, "tolerance": 0.01, "better": "lower"},
+      "bars_y_rms_pct": {"value": 0.29572944394309963, "tolerance": 0.013914659566507863, "better": "lower"},
+      "multiburst_u_rms_pct": {"value": 0.01233883961890939, "tolerance": 0.01, "better": "lower"},
+      "multiburst_v_rms_pct": {"value": 0.028753050748056373, "tolerance": 0.01, "better": "lower"},
+      "multiburst_y_rms_pct": {"value": 0.02828466658593045, "tolerance": 0.01, "better": "lower"},
+      "ramps_u_rms_pct": {"value": 0.02960237839658235, "tolerance": 0.01008337774495143, "better": "lower"},
+      "ramps_v_rms_pct": {"value": 0.062355220534615216, "tolerance": 0.01, "better": "lower"},
+      "ramps_y_rms_pct": {"value": 0.5085068348610579, "tolerance": 0.02820976001643749, "better": "lower"}
     },
     "DecoderTruth.NTSC_ntsc3d_FieldPhase": {
-      "motion_u_rms_pct": {"value": 0.6908066484687556, "tolerance": 0.04411950305444006, "better": "lower"},
-      "motion_v_rms_pct": {"value": 0.4330202699804462, "tolerance": 0.049472512717343584, "better": "lower"},
-      "motion_y_rms_pct": {"value": 0.7040121404351548, "tolerance": 0.07054809938919931, "better": "lower"}
+      "motion_u_rms_pct": {"value": 0.122123243081935, "tolerance": 0.04411950305444006, "better": "lower"},
+      "motion_v_rms_pct": {"value": 0.14663449545183668, "tolerance": 0.049472512717343584, "better": "lower"},
+      "motion_y_rms_pct": {"value": 0.4253028464229289, "tolerance": 0.07054809938919931, "better": "lower"}
     },
     "DecoderTruth.NTSC_ntsc3dnoadapt": {
-      "bars_u_rms_pct": {"value": 0.1794564483040556, "tolerance": 0.01, "better": "lower"},
-      "bars_v_rms_pct": {"value": 0.41889954602867574, "tolerance": 0.021046355505023987, "better": "lower"},
-      "bars_y_rms_pct": {"value": 5.3404596863979235, "tolerance": 0.2673319994385306, "better": "lower"},
+      "bars_u_rms_pct": {"value": 0.05803679490022603, "tolerance": 0.01, "better": "lower"},
+      "bars_v_rms_pct": {"value": 0.02851228072942281, "tolerance": 0.021046355505023987, "better": "lower"},
+      "bars_y_rms_pct": {"value": 0.27083400122432705, "tolerance": 0.2673319994385306, "better": "lower"},
       "multiburst_u_rms_pct": {"value": 3.921585125383751, "tolerance": 0.19608593402724295, "better": "lower"},
       "multiburst_v_rms_pct": {"value": 3.2891345084398975, "tolerance": 0.1644556573056919, "better": "lower"},
       "multiburst_y_rms_pct": {"value": 5.127635705914702, "tolerance": 0.2568263967354001, "better": "lower"},

@@ -260,6 +260,86 @@ TEST(Ntsc3dCombTest, DetailThresholdZero_FrameCombsWhereverStill) {
   EXPECT_GT(frameCombShare(still.separate(settings)), 0.8);
 }
 
+TEST(Ntsc3dCombTest, OneSidedStillColourBars_FrameCombsTheColourEdges) {
+  // The first frame of a sequence, frames after it only: still fine texture
+  // under bars of colour 64 samples wide, which the 2D comb gets wrong. Against
+  // a still neighbour the current frame's chroma, inverted, doubles at each
+  // colour edge and leaks through the low-frequency luma test; with the frame
+  // two away confirming the picture is still, that leak is allowed for, as it
+  // is with both neighbours.
+  Sequence bars;
+  for (int32_t k = 0; k < 5; k++) {
+    Plane frame = makeFrame(k, texture(7), 0.0, 0.0);
+    for (int32_t r = 0; r < kRows; r++) {
+      const int32_t line = frameLineOf(r);
+      if (line < kFirstActiveLine || line >= kLastActiveLine) continue;
+      for (int32_t h = kActiveStart; h < kActiveEnd; h++) {
+        const double theta = 1.3 * static_cast<double>((h - kActiveStart) / 64);
+        frame.set(r, h,
+                  frame.at(r, h) +
+                      std::lround(trueChroma(k, r, h, kAmplitude, theta)));
+      }
+    }
+    bars.frames.push_back(std::move(frame));
+  }
+  Ntsc3dComb::Frames f;
+  f.current = &bars.frames[2];
+  f.after = &bars.frames[3];
+  f.after2 = &bars.frames[4];
+  const auto result = Ntsc3dComb::separate(f, layout(), picture(), {});
+
+  // The samples within 4 of a colour edge (without the allowance, about a
+  // fifth of them are frame-combed).
+  double total = 0.0;
+  int64_t count = 0;
+  forInterior([&](int32_t r, int32_t h) {
+    const int32_t inBar = (h - kActiveStart) % 64;
+    if (inBar >= 4 && inBar < 60) return;
+    total += result.frameCombWeight.at(r, h);
+    count++;
+  });
+  EXPECT_GT(total / static_cast<double>(count), 0.6);
+  EXPECT_GT(frameCombShare(result), 0.9);
+}
+
+TEST(Ntsc3dCombTest,
+     ChromaChannelAcrossACut_MeasuredWithTheLuma_KeepsItsColour) {
+  // A Y/C source's chroma, with a cut after the current frame: the colour
+  // shifts a little, the luma (in the Y channel) changes. On the chroma alone
+  // the luma tests see nothing, so the frame passes as moving steadily, and
+  // the two frame combs disagree by less than their allowance: averaged, a
+  // quarter of the next scene's colour would come in. Measured on Y + C, the
+  // cut is plain, and the previous frame's comb alone is used.
+  const double nextTheta = kTheta + 0.8;
+  auto thetaOf = [&](int32_t k) { return k < 3 ? kTheta : nextTheta; };
+  const auto chroma = makeSequence([](int32_t) { return flat(0.0); }, thetaOf);
+  const auto measured =
+      makeSequence([](int32_t k) { return texture(k < 3 ? 7 : 9); }, thetaOf);
+  auto frames = [](const Sequence& s) {
+    Ntsc3dComb::Frames f;
+    f.before2 = &s.frames[0];
+    f.before = &s.frames[1];
+    f.current = &s.frames[2];
+    f.after = &s.frames[3];
+    f.after2 = &s.frames[4];
+    return f;
+  };
+  // (Frame-combed wherever still, so the 2D comb's own accuracy on flat
+  // colour does not hide which neighbours were used.)
+  Ntsc3dComb::Settings settings;
+  settings.detailThreshold = 0.0;
+
+  const auto alone =
+      Ntsc3dComb::separate(frames(chroma), layout(), picture(), settings);
+  const auto withLuma = Ntsc3dComb::separate(frames(chroma), frames(measured),
+                                             layout(), picture(), settings);
+
+  // A quarter of the shift is about 8 codes RMS; noise alone about 1.
+  EXPECT_GT(chromaRmsError(alone.chroma, 2, kAmplitude, kTheta), 5.0);
+  EXPECT_LT(chromaRmsError(withLuma.chroma, 2, kAmplitude, kTheta), 2.0);
+  EXPECT_GT(frameCombShare(withLuma), 0.8);
+}
+
 TEST(Ntsc3dCombTest, NoNeighbours_GivesThe2DComb) {
   const Plane frame = makeFrame(2, texture(7), kAmplitude, kTheta);
   Ntsc3dComb::Frames f;

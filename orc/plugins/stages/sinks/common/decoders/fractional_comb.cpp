@@ -10,6 +10,8 @@
 
 #include "fractional_comb.h"
 
+#include <orc/stage/cvbs_signal_constants.h>
+
 #include <algorithm>
 #include <cmath>
 #include <complex>
@@ -34,11 +36,10 @@ constexpr double kRidge = 0.01;
 constexpr double kRobustSpread = 0.2;
 constexpr int32_t kRobustSteps = 5;
 
-// Half-width of the chroma band fitted, and the sample rate.
+// Half-width of the chroma band fitted.
 // SMPTE 170M-2004 Section 7: chroma bandwidth about 1.3 MHz either side of
-// the subcarrier; 4fsc sampling = 4 x 315/88 MHz.
+// the subcarrier.
 constexpr double kBandHz = 1.3e6;
-constexpr double kSampleRateHz = 4.0 * 315e6 / 88.0;
 constexpr int32_t kBandSteps = 41;
 
 // Trusting a filter: fully below the first value, not at all above the
@@ -139,7 +140,7 @@ const DesignTable& designTable() {
 
 FractionalComb::Design FractionalComb::design(double d) {
   const double w0 = kPi / 2.0;
-  const double half = 2.0 * kPi * kBandHz / kSampleRateHz;
+  const double half = 2.0 * kPi * kBandHz / orc::kNtscSampleRate;
   const auto base = static_cast<int32_t>(std::floor(d));
 
   // Tap positions: the current line, then the line above (-1) and below (+1).
@@ -243,14 +244,17 @@ Plane FractionalComb::separate(const Plane& frame, const FieldLayout& layout,
   // than a central difference, whose fall-off would read steep edges as
   // shallower than they are.
   // (The derivatives are made a line at a time as the tensor's box means
-  // reach them, not stored.) Rows wrap round the frame and samples repeat
-  // the line's ends.
+  // reach them, not stored.) As in the box means, fields are never mixed:
+  // lines repeat the field's first and last, and samples the line's ends.
   const Plane luma = boxMean(frame, 4, 1, layout.field1Rows);
   const int32_t rows = frame.rows;
   const int32_t cols = frame.cols;
   auto derivative = [&](int32_t r, int32_t lines, int32_t samples, Sample* o) {
+    const bool first = r < layout.field1Rows;
+    const int32_t top = first ? 0 : layout.field1Rows;
+    const int32_t bottom = (first ? layout.field1Rows : rows) - 1;
     auto line = [&](int32_t k) {
-      return luma.row((((r + (k * lines)) % rows) + rows) % rows);
+      return luma.row(std::clamp(r + (k * lines), top, bottom));
     };
     const Sample* p1 = line(1);
     const Sample* m1 = line(-1);
